@@ -3,7 +3,7 @@
 
 OBJS:=$(patsubst %.c,%.o,$(wildcard *.c))
 
-LIBS=-lext2fs
+LIBS=-lext2fs -lpthread
 
 all: sparsify zerofree
 
