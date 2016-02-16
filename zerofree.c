@@ -380,10 +380,9 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 				}
 			}
 		}
+	}
 
-		if ( verbose ) {
-			printf("\r%u/%u/%u\n", modified, free_blk,
-				fs->super->s_blocks_count);
-		}
+	if ( verbose ) {
+		printf("\r%u/%u/%u\n", modified, free_blk, fs->super->s_blocks_count);
 	}
 }
