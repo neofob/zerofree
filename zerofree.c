@@ -24,6 +24,9 @@
 #define USAGE "usage: %s [-t count] [-n] [-v] [-d] [-f fillval] filesystem\n"
 
 pthread_barrier_t g_thread_barrier;
+pthread_mutex_t fs_mux;
+#define LOCK(x) pthread_mutex_lock(&x)
+#define UNLOCK(x) pthread_mutex_unlock(&x)
 
 void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
 		unsigned char* empty, unsigned int fillval, int dryrun,
@@ -206,6 +209,7 @@ void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
 	arg_array = malloc(sizeof(struct thread_arg)*thread_count);
 
 	pthread_barrier_init(&g_thread_barrier, NULL, thread_count+1);
+	pthread_mutex_init(&fs_mux, NULL);
 
 	pivot = fs->super->s_first_data_block;
 	part_size = (fs->super->s_blocks_count - fs->super->s_first_data_block)
@@ -250,15 +254,17 @@ inline void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
 {
 	int ret, i;
 	if ( ext2fs_test_block_bitmap(fs->block_map, blk) ) {
-		return;
+		goto _exit;
 	}
 
 	if (!discard) {
+		LOCK(fs_mux);
 		ret = io_channel_read_blk(fs->io, blk, 1, buf);
+		UNLOCK(fs_mux);
 		if ( ret ) {
 			fprintf(stderr, "error while reading block\n");
 			*error = 1;
-			return;
+			goto _exit;
 		}
 
 		for ( i=0; i < fs->blocksize; ++i ) {
@@ -268,27 +274,33 @@ inline void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
 		}
 
 		if ( i == fs->blocksize ) {
-			return;
+			goto _exit;
 		}
 	}
 
 	if ( !dryrun ) {
 		if (!discard) {
+			LOCK(fs_mux);
 			ret = io_channel_write_blk(fs->io, blk, 1, empty);
+			UNLOCK(fs_mux);
 			if ( ret ) {
 				fprintf(stderr, "error while writing block\n");
 				*error = 1;
-				return;
+				goto _exit;
 			}
 		} else { /* discard */
+			LOCK(fs_mux);
 			ret = io_channel_discard(fs->io, blk, 1);
+			UNLOCK(fs_mux);
 			if ( ret ) {
 				fprintf(stderr, "error while discarding block\n");
 				*error = 1;
-				return;
+				goto _exit;
 			}
 		}
 	}
+_exit:
+	return; /* This is to suppress gcc warning */
 }
 
 void* zero_thread(void* arg)
