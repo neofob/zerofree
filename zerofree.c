@@ -215,6 +215,7 @@ void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
 		arg_array[i].fs = fs;
 		arg_array[i].start_blk = pivot;
 		arg_array[i].end_blk = part_size*(i+1);
+		arg_array[i].fillval = fillval;
 		arg_array[i].dryrun = dryrun;
 		arg_array[i].discard = discard;
 		arg_array[i].empty = empty;
