@@ -153,12 +153,6 @@ int main(int argc, char **argv)
 
 	memset(empty, fillval, fs->blocksize);
 
-	ret = ext2fs_read_inode_bitmap(fs);
-	if ( ret ) {
-		fprintf(stderr, "%s: error while reading inode bitmap\n", argv[0]);
-		bailout((void*) empty, (void*) buf);
-	}
-
 	ret = ext2fs_read_block_bitmap(fs);
 	if ( ret ) {
 		fprintf(stderr, "%s: error while reading block bitmap\n", argv[0]);
