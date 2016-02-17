@@ -7,6 +7,7 @@
  * License, version 2.
  *
  * Changes:
+ * 2015-10-18  Use memcmp. Suggested by Damien Clarke
  * 2014-11-23  Add thread option Tuan T. Pham
  * 2014-11-22  Fix memory leak. Tuan T. Pham
  * 2010-10-17  Allow non-zero fill value.   Patch from Jacob Nevins.
@@ -267,15 +268,9 @@ inline void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
 			goto _exit;
 		}
 
-		for ( i=0; i < fs->blocksize; ++i ) {
-			if ( buf[i] != fillval ) {
-				break;
-			}
-		}
-
-		if ( i == fs->blocksize ) {
+		ret = memcmp(buf, empty, fs->blocksize);
+		if ( 0 == ret )
 			goto _exit;
-		}
 	}
 
 	if ( !dryrun ) {
@@ -363,16 +358,9 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 				fprintf(stderr, "error while reading block\n");
 				bailout((void*) empty, (void*) buf);
 			}
-
-			for ( i=0; i < fs->blocksize; ++i ) {
-				if ( buf[i] != fillval ) {
-					break;
-				}
-			}
-
-			if ( i == fs->blocksize ) {
+			ret = memcmp(buf, empty, fs->blocksize);
+			if ( 0 == ret )
 				continue;
-			}
 		}
 
 		++modified;
