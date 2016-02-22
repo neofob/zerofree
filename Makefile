@@ -18,5 +18,6 @@ zerofree: zerofree.o
 
 tags:$(wildcard *.c)
 	@ctags *.c
+
 clean:
 	@rm -f $(OBJS) sparsify zerofree tags

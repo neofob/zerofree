@@ -22,6 +22,20 @@
 #include <stdlib.h>
 #include <pthread.h>
 
+#if defined(EXT2_FLAG_64BITS)
+#define FLAGS (EXT2_FLAG_RW|EXT2_FLAG_64BITS)
+#define FORMAT "\r%llu/%llu/%llu\n"
+#else
+#define FLAGS EXT2_FLAG_RW
+#define blk64_t blk_t
+#define ext2fs_blocks_count(s) ((s)->s_blocks_count)
+#define ext2fs_free_blocks_count(s) ((s)->s_free_blocks_count)
+#define ext2fs_test_block_bitmap2(m,b) ext2fs_test_block_bitmap(m,b)
+#define io_channel_read_blk64(c,b,n,d) io_channel_read_blk(c,b,n,d)
+#define io_channel_write_blk64(c,b,n,d) io_channel_write_blk(c,b,n,d)
+#define FORMAT "\r%lu/%lu/%lu\n"
+#endif
+
 #define USAGE "usage: %s [-t count] [-n] [-v] [-d] [-f fillval] filesystem\n"
 
 pthread_barrier_t g_thread_barrier;
@@ -29,14 +43,14 @@ pthread_mutex_t fs_mux;
 #define LOCK(x) pthread_mutex_lock(&x)
 #define UNLOCK(x) pthread_mutex_unlock(&x)
 
-void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
+void zero_func(ext2_filsys fs, blk64_t  blk, unsigned char* buf,
 		unsigned char* empty, unsigned int fillval, int dryrun,
 		int discard, int* error);
 
 struct thread_arg {
 	ext2_filsys	fs;
-	unsigned long	start_blk;
-	unsigned long 	end_blk;
+	blk64_t		start_blk;
+	blk64_t		end_blk;
 	unsigned int	fillval;
 	int		dryrun;
 	int		discard;
@@ -59,10 +73,10 @@ int main(int argc, char **argv)
 	errcode_t ret;
 	int flags;
 	int superblock = 0;
-	int open_flags = EXT2_FLAG_RW;
+	int open_flags = FLAGS;
 	int blocksize = 0;
 	ext2_filsys fs = NULL;
-	unsigned long blk;
+	blk64_t	blk;
 	unsigned char *buf;
 	unsigned char *empty;
 	int i, c;
@@ -197,7 +211,7 @@ void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
 	int 			i, ret;
 	pthread_t		*tid_array;
 	struct thread_arg	*arg_array;
-	unsigned long		blk, part_size, pivot;
+	blk64_t			blk, part_size, pivot;
 	int			error = 0;
 
 	tid_array = malloc(sizeof(pthread_t)*thread_count);
@@ -243,7 +257,7 @@ void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
 	free(arg_array);
 }
 
-inline void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
+inline void zero_func(ext2_filsys fs, blk64_t blk, unsigned char* buf,
 		unsigned char* empty, unsigned int fillval, int dryrun,
 		int discard, int *error)
 {
@@ -254,7 +268,7 @@ inline void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
 
 	if (!discard) {
 		LOCK(fs_mux);
-		ret = io_channel_read_blk(fs->io, blk, 1, buf);
+		ret = io_channel_read_blk64(fs->io, blk, 1, buf);
 		UNLOCK(fs_mux);
 		if ( ret ) {
 			fprintf(stderr, "error while reading block\n");
@@ -270,7 +284,7 @@ inline void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
 	if ( !dryrun ) {
 		if (!discard) {
 			LOCK(fs_mux);
-			ret = io_channel_write_blk(fs->io, blk, 1, empty);
+			ret = io_channel_write_blk64(fs->io, blk, 1, empty);
 			UNLOCK(fs_mux);
 			if ( ret ) {
 				fprintf(stderr, "error while writing block\n");
@@ -296,7 +310,7 @@ void* zero_thread(void* arg)
 {
 	struct thread_arg m_arg = *(struct thread_arg*) arg;
 	unsigned char *buf;
-	unsigned long blk;
+	blk64_t	blk;
 	int	error = 0;
 
 	buf = (unsigned char*) malloc(m_arg.fs->blocksize);
@@ -318,7 +332,7 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 		int verbose, int discard, unsigned char *empty,
 		unsigned char *buf)
 {
-	unsigned long	blk, free_blk, modified;
+	blk64_t		blk, free_blk, modified;
 	double		percent;
 	int		old_percent, ret, i;
 
@@ -331,7 +345,7 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 	}
 
 	for ( blk=fs->super->s_first_data_block;
-		blk < fs->super->s_blocks_count; blk++ ) {
+			blk < ext2fs_blocks_count(fs->super); blk++ ) {
 
 		if ( ext2fs_test_block_bitmap(fs->block_map, blk) ) {
 			continue;
@@ -339,7 +353,7 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 
 		++free_blk;
 		percent = 100.0 * (double)free_blk/
-					(double)fs->super->s_free_blocks_count;
+					(double)ext2fs_free_blocks_count(fs->super);
 
 		if ( verbose && (int)(percent*10) != old_percent ) {
 			fprintf(stderr, "\r%4.1f%%", percent);
@@ -347,7 +361,7 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 		}
 
 		if (!discard) {
-			ret = io_channel_read_blk(fs->io, blk, 1, buf);
+			ret = io_channel_read_blk64(fs->io, blk, 1, buf);
 			if ( ret ) {
 				fprintf(stderr, "error while reading block\n");
 				bailout((void*) empty, (void*) buf);
@@ -361,7 +375,7 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 
 		if ( !dryrun ) {
 			if (!discard) {
-				ret = io_channel_write_blk(fs->io, blk, 1, empty);
+				ret = io_channel_write_blk64(fs->io, blk, 1, empty);
 				if ( ret ) {
 					fprintf(stderr, "error while writing block\n");
 					bailout((void*) empty, (void*) buf);
@@ -377,6 +391,6 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 	}
 
 	if ( verbose ) {
-		printf("\r%u/%u/%u\n", modified, free_blk, fs->super->s_blocks_count);
+		printf(FORMAT, modified, free_blk, ext2fs_blocks_count(fs->super));
 	}
 }
