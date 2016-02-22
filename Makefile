@@ -16,5 +16,7 @@ sparsify: sparsify.o
 zerofree: zerofree.o
 	@gcc -g -o zerofree zerofree.o $(LIBS)
 
+tags:$(wildcard *.c)
+	@ctags *.c
 clean:
-	@rm -f $(OBJS) sparsify zerofree
+	@rm -f $(OBJS) sparsify zerofree tags
