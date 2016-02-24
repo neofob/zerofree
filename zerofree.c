@@ -221,7 +221,7 @@ void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
 	pthread_mutex_init(&fs_mux, NULL);
 
 	pivot = fs->super->s_first_data_block;
-	part_size = (fs->super->s_blocks_count - fs->super->s_first_data_block)
+	part_size = (ext2fs_blocks_count(fs->super) - fs->super->s_first_data_block)
 			/thread_count;
 
 	for (i=0; i < thread_count; i++) {
@@ -240,8 +240,8 @@ void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
 	}
 
 	/* process the remaining blocks */
-	if (pivot < fs->super->s_blocks_count) {
-		for (blk = pivot; blk < fs->super->s_blocks_count; blk++)
+	if (pivot < ext2fs_blocks_count(fs->super)) {
+		for (blk = pivot; blk < ext2fs_blocks_count(fs->super); blk++)
 		{
 			zero_func(fs, blk, buf, empty, fillval, dryrun,
 				discard, &error);
@@ -262,7 +262,7 @@ inline void zero_func(ext2_filsys fs, blk64_t blk, unsigned char* buf,
 		int discard, int *error)
 {
 	int ret, i;
-	if ( ext2fs_test_block_bitmap(fs->block_map, blk) ) {
+	if ( ext2fs_test_block_bitmap2(fs->block_map, blk) ) {
 		goto _exit;
 	}
 
@@ -347,7 +347,7 @@ void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
 	for ( blk=fs->super->s_first_data_block;
 			blk < ext2fs_blocks_count(fs->super); blk++ ) {
 
-		if ( ext2fs_test_block_bitmap(fs->block_map, blk) ) {
+		if ( ext2fs_test_block_bitmap2(fs->block_map, blk) ) {
 			continue;
 		}
 
