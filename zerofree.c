@@ -5,54 +5,73 @@
  *
  * This file may be redistributed under the terms of the GNU General Public
  * License, version 2.
- *
- * Changes:
- * 2015-10-18  Use memcmp. Suggested by Damien Clarke
- * 2014-11-23  Add thread option Tuan T. Pham
- * 2014-11-22  Fix memory leak. Tuan T. Pham
- * 2010-10-17  Allow non-zero fill value.   Patch from Jacob Nevins.
- * 2007-08-12  Allow use on filesystems mounted read-only.   Patch from
- *             Jan Krämer.
  */
 
+#define _POSIX_C_SOURCE 200112L // Enables POSIX.1-2001 features including posix_memalign
+
+#include <sys/types.h>
 #include <ext2fs/ext2fs.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
-#include <pthread.h>
+#include <stdint.h>
+#include <immintrin.h>
 
-#define USAGE "usage: %s [-t count] [-n] [-v] [-d] [-f fillval] filesystem\n"
+#define USAGE "usage: %s [-n] [-v] [-d] [-f fillval] filesystem\n"
 
-pthread_barrier_t g_thread_barrier;
-pthread_mutex_t fs_mux;
-#define LOCK(x) pthread_mutex_lock(&x)
-#define UNLOCK(x) pthread_mutex_unlock(&x)
+/*
+ * 512 blocks is 2MB for a standard 4KB filesystem block size.
+ * This is the sweet spot for maximum I/O performance on modern Linux systems.
+ */
+#define BATCH_BLOCKS 512
 
-void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
-		unsigned char* empty, unsigned int fillval, int dryrun,
-		int discard, int* error);
-
-struct thread_arg {
-	ext2_filsys	fs;
-	unsigned long	start_blk;
-	unsigned long 	end_blk;
-	unsigned int	fillval;
-	int		dryrun;
-	int		discard;
-	unsigned char	*empty;		/* shared by all threads */
-};
-
-void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
-		int verbose, int discard, unsigned char *empty,
-		unsigned char *buf);
-
-void* zero_thread(void* arg);
-void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
-		int dryrun, int discard, unsigned char *empty,
-		unsigned char *buf);
+#if defined(__GNUC__) || defined(__clang__)
+#define ASSUME_ALIGNED(ptr, align) __builtin_assume_aligned((ptr), (align))
+#define force_inline __attribute__((always_inline)) inline
+#else
+#define ASSUME_ALIGNED(ptr, align) (ptr)
+#define force_inline inline
+#endif
 
 void bailout(void* mem0, void* mem1) __attribute__ ((noreturn));
+
+/*
+ * Vectorized block comparison.
+ * Processes blocks using AVX-512 or AVX2 to detect if all bytes match the fill value.
+ */
+static force_inline int is_block_filled(const unsigned char * restrict buf, size_t len, unsigned char fillval) {
+	size_t i = 0;
+	const unsigned char *p = buf;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+	__m512i v_fill = _mm512_set1_epi8(fillval);
+	while (i + 64 <= len) {
+		__m512i v_data = _mm512_loadu_si512((const __m512i *)(p + i));
+		__mmask64 mask = _mm512_cmpeq_epi8_mask(v_data, v_fill);
+		if (mask != 0xFFFFFFFFFFFFFFFFULL) return 0;
+		i += 64;
+	}
+#elif defined(__AVX2__)
+	__m256i v_fill = _mm256_set1_epi8(fillval);
+	while (i + 32 <= len) {
+		__m256i v_data = _mm256_loadu_si256((const __m256i *)(p + i));
+		__m256i v_cmp = _mm256_cmpeq_epi8(v_data, v_fill);
+		if (_mm256_movemask_epi8(v_cmp) != 0xFFFFFFFF) return 0;
+		i += 32;
+	}
+#endif
+
+	/* Scalar fallback for remaining bytes */
+	while (i < len) {
+		if (p[i] != fillval) return 0;
+		i++;
+	}
+
+	return 1;
+}
+
 
 int main(int argc, char **argv)
 {
@@ -62,32 +81,20 @@ int main(int argc, char **argv)
 	int open_flags = EXT2_FLAG_RW;
 	int blocksize = 0;
 	ext2_filsys fs = NULL;
-	unsigned long blk;
-	unsigned char *buf;
-	unsigned char *empty;
-	int i, c;
+	unsigned char *buf = NULL;
+	unsigned char *empty = NULL;
+	int c;
 	unsigned int fillval = 0;
 	int verbose = 0;
 	int dryrun = 0;
 	int discard = 0;
-	long thread_count = 1;
+	unsigned long free_blk = 0;
+	unsigned long modified = 0;
+	double percent = 0.0;
+	int old_percent = -1;
 
-	while ( (c=getopt(argc, argv, "t:nvdf:")) != -1 ) {
+	while ( (c=getopt(argc, argv, "nvdf:")) != -1 ) {
 		switch (c) {
-		case 't':
-			{
-				char *endptr;
-				thread_count = strtol(optarg, &endptr, 0);
-				if (!*optarg || *endptr || thread_count < 0) {
-					fprintf(stderr, "%s: invalid argument"
-						" to -t\n", argv[0]);
-					return 1;
-				}
-				fprintf(stderr, "USE %d threads\n", thread_count);
-				fprintf(stderr, "WARNING: Running multiple threads"
-					" might damage your spinning device!\n");
-			}
-			break;
 		case 'n' :
 			dryrun = 1;
 			break;
@@ -108,7 +115,7 @@ int main(int argc, char **argv)
 					fprintf(stderr, "%s: fill value must be 0-255\n", argv[0]);
 					return 1;
 				}
-				printf("fillval = %d\n", fillval);
+				printf("fillval = %u\n", fillval);
 			}
 			break;
 		default :
@@ -124,7 +131,7 @@ int main(int argc, char **argv)
 
 	ret = ext2fs_check_if_mounted(argv[optind], &flags);
 	if ( ret ) {
-		fprintf(stderr, "%s: failed to determine filesystem mount state  %s\n",
+		fprintf(stderr, "%s: failed to determine filesystem mount state	%s\n",
 			argv[0], argv[optind]);
 		return 1;
 	}
@@ -135,23 +142,37 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	ret = ext2fs_open(argv[optind], open_flags, superblock, blocksize,
+	/*
+	 * Try opening with Linux Direct I/O enabled first to bypass Page Cache.
+	 * Bypasses physical memory buffer thrashing.
+	 */
+	ret = ext2fs_open(argv[optind], open_flags | EXT2_FLAG_DIRECT_IO, superblock, blocksize,
 							unix_io_manager, &fs);
 	if ( ret ) {
-		fprintf(stderr, "%s: failed to open filesystem %s\n",
-			argv[0], argv[optind]);
-		return 1;
+		/* Fallback to buffered standard I/O if Direct I/O is unsupported (e.g. on legacy virtual target drives) */
+		ret = ext2fs_open(argv[optind], open_flags, superblock, blocksize,
+								unix_io_manager, &fs);
+		if ( ret ) {
+			fprintf(stderr, "%s: failed to open filesystem %s\n",
+				argv[0], argv[optind]);
+			return 1;
+		}
+	} else {
+		if (verbose) {
+			printf("Opened filesystem with Linux Direct I/O enabled (Bypassing Page Cache).\n");
+		}
 	}
 
-	empty = (unsigned char *)malloc(fs->blocksize);
-	buf = (unsigned char *)malloc(fs->blocksize);
+	const size_t batch_bytes = (size_t)BATCH_BLOCKS * fs->blocksize;
+	const size_t alignment = 4096; // 4KB Boundary aligns physical NVMe sectors and CPU vector registers
 
-	if ( empty == NULL || buf == NULL ) {
-		fprintf(stderr, "%s: out of memory (surely not?)\n", argv[0]);
+	if (posix_memalign((void **)&empty, alignment, batch_bytes) != 0 ||
+			posix_memalign((void **)&buf, alignment, batch_bytes) != 0) {
+		fprintf(stderr, "%s: out of memory\n", argv[0]);
 		bailout((void*) empty, (void*) buf);
 	}
 
-	memset(empty, fillval, fs->blocksize);
+	memset(empty, fillval, batch_bytes);
 
 	ret = ext2fs_read_block_bitmap(fs);
 	if ( ret ) {
@@ -159,11 +180,109 @@ int main(int argc, char **argv)
 		bailout((void*) empty, (void*) buf);
 	}
 
-	if (thread_count == 1) {
-		single_thread(fs, fillval, dryrun, verbose, discard, empty, buf);
+	if ( verbose ) {
+		fprintf(stderr, "\r%4.1f%%", percent);
 	}
-	else {
-		multi_thread(fs, thread_count, fillval, dryrun, discard, empty, buf);
+
+	const unsigned long max_blocks = fs->super->s_blocks_count;
+	unsigned long blk = fs->super->s_first_data_block;
+
+	double total_free_blocks = (double)fs->super->s_free_blocks_count;
+	if (total_free_blocks < 1.0) {
+		total_free_blocks = 1.0;
+	}
+
+	while (blk < max_blocks) {
+		// 1. Skip blocks that are in use (not free)
+		if (ext2fs_test_block_bitmap(fs->block_map, blk)) {
+			blk++;
+			continue;
+		}
+
+		// 2. Identify a contiguous run of free blocks
+		unsigned long run_start = blk;
+		unsigned long run_len = 0;
+		while (blk < max_blocks &&
+					 !ext2fs_test_block_bitmap(fs->block_map, blk) &&
+					 run_len < BATCH_BLOCKS) {
+			run_len++;
+			blk++;
+		}
+
+		// 3. Process the contiguous run of blocks
+		if (!discard) {
+			// Read the entire contiguous run in one unified Direct I/O call
+			ret = io_channel_read_blk(fs->io, run_start, run_len, buf);
+			if ( ret ) {
+				fprintf(stderr, "error while reading blocks starting at %lu\n", run_start);
+				bailout((void*) empty, (void*) buf);
+			}
+
+			unsigned char * restrict r_buf = buf;
+			unsigned char * restrict r_empty = empty;
+			const size_t b_size = fs->blocksize;
+
+			unsigned long write_run_start = 0;
+			unsigned long write_run_len = 0;
+
+			for (unsigned long i = 0; i < run_len; i++) {
+				unsigned char *block_ptr = r_buf + (i * b_size);
+				int is_different = !is_block_filled(block_ptr, b_size, fillval);
+
+				if (is_different) {
+					modified++;
+					if (!dryrun) {
+						if (write_run_len == 0) {
+							write_run_start = run_start + i;
+						}
+						write_run_len++;
+					}
+				} else {
+					// We hit a matching block. Flush any pending write runs.
+					if (write_run_len > 0) {
+						ret = io_channel_write_blk(fs->io, write_run_start, write_run_len, r_empty);
+						if ( ret ) {
+							fprintf(stderr, "error while writing blocks starting at %lu\n", write_run_start);
+							bailout((void*) empty, (void*) buf);
+						}
+						write_run_len = 0;
+					}
+				}
+			}
+
+			// Write any remaining trailing dirty blocks
+			if (write_run_len > 0) {
+				ret = io_channel_write_blk(fs->io, write_run_start, write_run_len, r_empty);
+				if ( ret ) {
+					fprintf(stderr, "error while writing blocks starting at %lu\n", write_run_start);
+					bailout((void*) empty, (void*) buf);
+				}
+			}
+		} else { /* discard/TRIM mode */
+			modified += run_len;
+			if (!dryrun) {
+				// Discard the whole sequence at once (translates to a single BLKDISCARD ioctl on Linux)
+				ret = io_channel_discard(fs->io, run_start, run_len);
+				if ( ret ) {
+					fprintf(stderr, "error while discarding blocks starting at %lu\n", run_start);
+					bailout((void*) empty, (void*) buf);
+				}
+			}
+		}
+
+		// 4. Update the CLI progress stats (massively reduced frequency due to chunk processing)
+		free_blk += run_len;
+		if ( verbose ) {
+			percent = 100.0 * (double)free_blk / total_free_blocks;
+			if ( (int)(percent * 10) != old_percent ) {
+				fprintf(stderr, "\r%4.1f%%", percent);
+				old_percent = (int)(percent * 10);
+			}
+		}
+	}
+
+	if ( verbose ) {
+		printf("\r%lu/%lu/%u\n", modified, free_blk, fs->super->s_blocks_count);
 	}
 
 	ret = ext2fs_close(fs);
@@ -188,195 +307,4 @@ void bailout(void* mem0, void* mem1)
 	}
 
 	exit(1);
-}
-
-void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
-		int dryrun, int discard, unsigned char *empty,
-		unsigned char *buf)
-{
-	int 			i, ret;
-	pthread_t		*tid_array;
-	struct thread_arg	*arg_array;
-	unsigned long		blk, part_size, pivot;
-	int			error = 0;
-
-	tid_array = malloc(sizeof(pthread_t)*thread_count);
-	arg_array = malloc(sizeof(struct thread_arg)*thread_count);
-
-	pthread_barrier_init(&g_thread_barrier, NULL, thread_count+1);
-	pthread_mutex_init(&fs_mux, NULL);
-
-	pivot = fs->super->s_first_data_block;
-	part_size = (fs->super->s_blocks_count - fs->super->s_first_data_block)
-			/thread_count;
-
-	for (i=0; i < thread_count; i++) {
-		arg_array[i].fs = fs;
-		arg_array[i].start_blk = pivot;
-		arg_array[i].end_blk = part_size*(i+1);
-		arg_array[i].fillval = fillval;
-		arg_array[i].dryrun = dryrun;
-		arg_array[i].discard = discard;
-		arg_array[i].empty = empty;
-
-		pivot += part_size;
-
-		ret = pthread_create(&tid_array[i], NULL, zero_thread,
-					&arg_array[i]);
-	}
-
-	/* process the remaining blocks */
-	if (pivot < fs->super->s_blocks_count) {
-		for (blk = pivot; blk < fs->super->s_blocks_count; blk++)
-		{
-			zero_func(fs, blk, buf, empty, fillval, dryrun,
-				discard, &error);
-		}
-	}
-
-	pthread_barrier_wait(&g_thread_barrier);
-	for (i=0; i < thread_count; i++) {
-		pthread_join(tid_array[i], NULL);
-	}
-
-	free(tid_array);
-	free(arg_array);
-}
-
-inline void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
-		unsigned char* empty, unsigned int fillval, int dryrun,
-		int discard, int *error)
-{
-	int ret, i;
-	if ( ext2fs_test_block_bitmap(fs->block_map, blk) ) {
-		goto _exit;
-	}
-
-	if (!discard) {
-		LOCK(fs_mux);
-		ret = io_channel_read_blk(fs->io, blk, 1, buf);
-		UNLOCK(fs_mux);
-		if ( ret ) {
-			fprintf(stderr, "error while reading block\n");
-			*error = 1;
-			goto _exit;
-		}
-
-		ret = memcmp(buf, empty, fs->blocksize);
-		if ( 0 == ret )
-			goto _exit;
-	}
-
-	if ( !dryrun ) {
-		if (!discard) {
-			LOCK(fs_mux);
-			ret = io_channel_write_blk(fs->io, blk, 1, empty);
-			UNLOCK(fs_mux);
-			if ( ret ) {
-				fprintf(stderr, "error while writing block\n");
-				*error = 1;
-				goto _exit;
-			}
-		} else { /* discard */
-			LOCK(fs_mux);
-			ret = io_channel_discard(fs->io, blk, 1);
-			UNLOCK(fs_mux);
-			if ( ret ) {
-				fprintf(stderr, "error while discarding block\n");
-				*error = 1;
-				goto _exit;
-			}
-		}
-	}
-_exit:
-	return; /* This is to suppress gcc warning */
-}
-
-void* zero_thread(void* arg)
-{
-	struct thread_arg m_arg = *(struct thread_arg*) arg;
-	unsigned char *buf;
-	unsigned long blk;
-	int	error = 0;
-
-	buf = (unsigned char*) malloc(m_arg.fs->blocksize);
-
-	for (blk = m_arg.start_blk; blk < m_arg.end_blk; blk++) {
-		zero_func(m_arg.fs, blk, buf, m_arg.empty, m_arg.fillval,
-				m_arg.dryrun, m_arg.discard, &error);
-		if (error) {
-			break;
-		}
-	}
-
-	free(buf);
-	pthread_barrier_wait(&g_thread_barrier);
-	return (void*) ((unsigned long) error);
-}
-
-void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
-		int verbose, int discard, unsigned char *empty,
-		unsigned char *buf)
-{
-	unsigned long	blk, free_blk, modified;
-	double		percent;
-	int		old_percent, ret, i;
-
-	free_blk = modified = 0;
-	percent = 0.0;
-	old_percent = -1;
-
-	if ( verbose ) {
-		fprintf(stderr, "\r%4.1f%%", percent);
-	}
-
-	for ( blk=fs->super->s_first_data_block;
-		blk < fs->super->s_blocks_count; blk++ ) {
-
-		if ( ext2fs_test_block_bitmap(fs->block_map, blk) ) {
-			continue;
-		}
-
-		++free_blk;
-		percent = 100.0 * (double)free_blk/
-					(double)fs->super->s_free_blocks_count;
-
-		if ( verbose && (int)(percent*10) != old_percent ) {
-			fprintf(stderr, "\r%4.1f%%", percent);
-			old_percent = (int)(percent*10);
-		}
-
-		if (!discard) {
-			ret = io_channel_read_blk(fs->io, blk, 1, buf);
-			if ( ret ) {
-				fprintf(stderr, "error while reading block\n");
-				bailout((void*) empty, (void*) buf);
-			}
-			ret = memcmp(buf, empty, fs->blocksize);
-			if ( 0 == ret )
-				continue;
-		}
-
-		++modified;
-
-		if ( !dryrun ) {
-			if (!discard) {
-				ret = io_channel_write_blk(fs->io, blk, 1, empty);
-				if ( ret ) {
-					fprintf(stderr, "error while writing block\n");
-					bailout((void*) empty, (void*) buf);
-				}
-			} else { /* discard */
-				ret = io_channel_discard(fs->io, blk, 1);
-				if ( ret ) {
-					fprintf(stderr, " error while discarding block\n");
-					bailout((void*) empty, (void*) buf);
-				}
-			}
-		}
-	}
-
-	if ( verbose ) {
-		printf("\r%u/%u/%u\n", modified, free_blk, fs->super->s_blocks_count);
-	}
 }
