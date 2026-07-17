@@ -37,10 +37,31 @@
 
 void bailout(void* mem0, void* mem1) __attribute__ ((noreturn));
 
-/*
- * Vectorized block comparison.
- * Processes blocks using AVX-512 or AVX2 to detect if all bytes match the fill value.
- */
+static force_inline int is_block_zero(const unsigned char * restrict buf, size_t len) {
+	size_t i = 0;
+	const unsigned char *p = buf;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+	while (i + 64 <= len) {
+		__m512i v_data = _mm512_loadu_si512((const __m512i *)(p + i));
+		if (!_mm512_testz_epi32(v_data, v_data)) return 0;
+		i += 64;
+	}
+#elif defined(__AVX2__)
+	while (i + 32 <= len) {
+		__m256i v_data = _mm256_loadu_si256((const __m256i *)(p + i));
+		if (!_mm256_testz_si256(v_data, v_data)) return 0;
+		i += 32;
+	}
+#endif
+
+	while (i < len) {
+		if (p[i] != 0) return 0;
+		i++;
+	}
+	return 1;
+}
+
 static force_inline int is_block_filled(const unsigned char * restrict buf, size_t len, unsigned char fillval) {
 	size_t i = 0;
 	const unsigned char *p = buf;
@@ -227,7 +248,7 @@ int main(int argc, char **argv)
 
 			for (unsigned long i = 0; i < run_len; i++) {
 				unsigned char *block_ptr = r_buf + (i * b_size);
-				int is_different = !is_block_filled(block_ptr, b_size, fillval);
+				int is_different = (fillval == 0) ? !is_block_zero(block_ptr, b_size) : !is_block_filled(block_ptr, b_size, fillval);
 
 				if (is_different) {
 					modified++;
