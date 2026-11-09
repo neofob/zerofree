@@ -490,7 +490,11 @@ int main(int argc, char **argv)
 	}
 
 	/* The bitmap type is opaque in the public header, so take a copy of
-	 * its bits for [s_first_data_block, blocks_count) for the word scan. */
+	 * its bits for [s_first_data_block, blocks_count) for the word scan.
+	 * On bigalloc the block bitmap is one bit per CLUSTER, so range2
+	 * cannot yield one bit per block; build the map per block with the
+	 * same API the old per-block scan used (B2C-correct internally).
+	 * One library call per block, paid only on bigalloc images. */
 	{
 		blk64_t first = c.fs->super->s_first_data_block;
 		blk64_t nbits = c.total > first ? c.total - first : 0;
@@ -501,9 +505,14 @@ int main(int argc, char **argv)
 				argv[0]);
 			finish(&c, 1);
 		}
-		if (nbits &&
-		    ext2fs_get_block_bitmap_range2(c.fs->block_map, first,
-						   nbits, c.fmap)) {
+		if (ext2fs_has_feature_bigalloc(c.fs->super)) {
+			for (blk64_t b = first; b < c.total; b++)
+				if (ext2fs_test_block_bitmap2(c.fs->block_map, b))
+					c.fmap[(b - first) >> 3] |=
+						1u << ((b - first) & 7);
+		} else if (nbits &&
+			   ext2fs_get_block_bitmap_range2(c.fs->block_map, first,
+							  nbits, c.fmap)) {
 			fprintf(stderr, "%s: error while reading block bitmap\n",
 				argv[0]);
 			finish(&c, 1);

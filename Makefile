@@ -50,4 +50,4 @@ test: zerofree unit
 tags:$(wildcard *.c)
 	@ctags *.c
 clean:
-	@rm -f $(OBJS) sparsify zerofree tags tests/unit_filled tests/run_scan tests/zio_test
+	@rm -f $(OBJS) sparsify zerofree tags tests/run_scan tests/zio_test

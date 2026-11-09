@@ -202,10 +202,17 @@ I/O protocol (pinned, from builder review 2026-11-09):
    `c->fs->block_map->map` in 64-bit words: free = bit clear; mask words
    against `[s_first_data_block, blocks_count)`; use `__builtin_ctzll` /
    leading-zero to jump run-to-run. Semantics identical: a block is free
-   iff its bit is clear in the block group bitmap. (The struct and its
-   `map` member are in the public e2fsprogs header; this is not a
-   private-ABI poke, but it is a version assumption — noted in a comment,
-   pinned by the ≥1.42 `#error` guard.)
+   iff its bit is clear in the block group bitmap.
+
+    *Correction (implementation):* on the target system the bitmap type in
+    the public header is **opaque** (only
+    `struct ext2fs_struct_generic_bitmap_base {magic, fs}` is exposed), so
+    `block_map->map` does not compile. The scan instead runs over a
+    **private copy** of the bits for `[s_first_data_block, blocks_count)`,
+    taken with the public `ext2fs_get_block_bitmap_range2` (transient,
+    `nbits/8` bytes). Bigalloc caveat: on bigalloc the block bitmap is one
+    bit per *cluster*, so the private map is built per block with
+    `ext2fs_test_block_bitmap2` instead (same API as the old scan).
 11. **Per-block counters and progress stay.** The `free_blk++`/
     `modified++` loops and the per-block `progress()` calls (fill and
     discard modes alike) are kept exactly as today: the 2026-11-08 plan
