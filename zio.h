@@ -10,6 +10,31 @@
 #define ZIO_MAX_SLOTS 8
 #define ZIO_CHUNK_BYTES ((size_t)1 << 22)	/* 4 MiB */
 
+#define ZIO_MAX_WRITES 128	/* private: concurrent in-flight writes */
+
+struct zio_ring {			/* private: raw io_uring state */
+	int		fd;		/* ring fd, -1 when unused */
+	void		*sq, *cq, *sqes;	/* mmaps, NULL when unused */
+	size_t		sq_sz, cq_sz, sqes_sz;
+	unsigned int	*sq_head, *sq_tail, *sq_mask, *sq_array;
+	unsigned int	*cq_head, *cq_tail, *cq_mask;
+	unsigned char	*cqes;
+	unsigned int	sq_entries;
+	unsigned int	pending;	/* SQEs written but not yet entered */
+};
+
+struct zio_slot {			/* private: one in-order read */
+	uint64_t	blk, count, done_bytes;
+	bool		in_flight, err;
+	int		res;
+};
+
+struct zio_wrec {			/* private: one in-flight write */
+	uint64_t	off;
+	size_t		len, done;
+	bool		used;
+};
+
 struct zio {
 	int		fd;		/* -1 until zio_open succeeds */
 	bool		use_uring;
@@ -19,7 +44,13 @@ struct zio {
 	/* private engine state follows (ring, slots, seq counters) */
 	uint64_t	pending_blk;
 	unsigned int	pending_count;
-	size_t		done;
+	size_t		done;		/* sync mode only */
+	struct zio_ring	ring;
+	struct zio_slot	slots[ZIO_MAX_SLOTS];
+	uint64_t	next_seq, want_seq;
+	unsigned int	rd_inflight, wr_inflight;
+	bool		wr_failed;
+	struct zio_wrec	wrecs[ZIO_MAX_WRITES];
 };
 
 /* Open the data fd (rdonly ? O_RDONLY : O_RDWR, both |O_CLOEXEC),
