@@ -193,12 +193,18 @@ int main(void)
 
 	/* Case 7: random -- 3 seeded PRNGs x 64 KiB random bitmaps, full
 	 * extent plus a mid-range [37, 5000) window, compared against the
-	 * reference per-block scan. */
+	 * reference per-block scan. Bytes come from the LCG's middle byte
+	 * (bits 16..23): the low byte's bit 0 toggles on every LCG step,
+	 * so two adjacent bit-0 positions are never both free, capping
+	 * free runs at 15 blocks; the mixed middle byte removes that
+	 * correlation so runs of random length (up to ~20 blocks,
+	 * including runs that cross a 64-block word boundary and exercise
+	 * the iterator's word-by-word stepping) occur. */
 	static const uint32_t seeds[] = { 0x5EED01u, 0x5EED02u, 0x5EED03u };
 	for (i = 0; i < 3; i++) {
 		lcg_state = seeds[i];
 		for (int b = 0; b < 65536; b++)
-			m[b] = (unsigned char)lcg();
+			m[b] = (unsigned char)(lcg() >> 16);	/* middle byte */
 		snprintf(name, sizeof name, "random seed %u full extent",
 			 seeds[i]);
 		check_range(name, m, 0, 65536);

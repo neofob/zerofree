@@ -33,13 +33,19 @@ static inline void run_it_init(struct run_it *it, const unsigned char *map,
  * Next maximal run of FREE blocks at/after it->pos, fully inside
  * [lo, hi). Returns 0 and sets *start and *len, or 1 when done.
  *
- * Per word w covering blocks base = w*64 .. base+63: load 8 bytes with
+ * Per word w covering blocks base = w*64 .. base+63: load the word with
  * memcpy (the map need not be aligned), keep only the valid window
  * [it->pos, min(base+64, hi)) -- hi - base == 64 means "all ones", so
  * the shift below is always in [0, 63] -- and take free bits as
  * ~bits & mask. The first free bit starts the run (ctzll); the run
  * ends at the first used bit found by stepping word by word from
  * there, or at hi.
+ *
+ * Bounded loads: the iterator never reads past byte ceil(hi/8) of map.
+ * For the final partial word (hi < base + 64) only
+ * ceil((hi - base)/8) bytes are memcpy'd, into a zero-initialized
+ * word; every use of a loaded word masks off bits at/above hi before
+ * interpreting them, so the zero-filled high bytes are never observed.
  */
 static inline int next_run(struct run_it *it, uint64_t *start, uint64_t *len)
 {
@@ -48,10 +54,12 @@ static inline int next_run(struct run_it *it, uint64_t *start, uint64_t *len)
 		uint64_t w = it->pos >> 6, base = w << 6;
 		uint64_t lo_b = it->pos > base ? it->pos : base;
 		uint64_t hi_b = hi < base + 64 ? hi : base + 64;
-		uint64_t bits, free_bits, mask;
+		uint64_t bits = 0, free_bits, mask;
+		size_t nb;
 		if (lo_b >= hi_b)
 			return 1;
-		memcpy(&bits, it->map + (w << 3), 8);
+		nb = hi < base + 64 ? (size_t)((hi - base + 7) / 8) : 8;
+		memcpy(&bits, it->map + (w << 3), nb);
 		mask = (hi_b - base == 64 ? ~0ULL
 				       : (1ULL << (hi_b - base)) - 1) &
 			 (~0ULL << (lo_b - base));
@@ -64,9 +72,11 @@ static inline int next_run(struct run_it *it, uint64_t *start, uint64_t *len)
 		/* now find the first USED bit at/after pos, word by word */
 		w = pos >> 6;
 		while (1) {
-			uint64_t b2, m, shift = (w << 6) < pos ?
+			uint64_t b2 = 0, m, shift = (w << 6) < pos ?
 						 pos - (w << 6) : 0;
-			memcpy(&b2, it->map + (w << 3), 8);
+			size_t nb = hi < (w << 6) + 64 ?
+				     (size_t)((hi - (w << 6) + 7) / 8) : 8;
+			memcpy(&b2, it->map + (w << 3), nb);
 			m = b2 & (~0ULL << shift);
 			if (hi < (w << 6) + 64)
 				m &= (1ULL << (hi - (w << 6))) - 1;
@@ -76,7 +86,7 @@ static inline int next_run(struct run_it *it, uint64_t *start, uint64_t *len)
 				it->pos = pos + *len;
 				return 0;
 			}
-			if (hi <= (w << 6) + 64) {	/* run runs to hi */
+			if (hi <= (w << 6) + 64) {	/* free run extends to hi */
 				*start = pos;
 				*len = hi - pos;
 				it->pos = hi;
