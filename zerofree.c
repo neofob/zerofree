@@ -78,6 +78,7 @@ struct zf_ctx {
 	uint8_t		fill;
 	bool		dryrun;
 	bool		discard;
+	bool		engine_wrote;
 	bool		verbose;
 	blk64_t		free_blk;
 	blk64_t		free_total;
@@ -164,7 +165,10 @@ static int flush_dirty(struct zf_ctx *c, blk64_t blk, blk64_t count)
 			return 0;
 	}
 
-	return zio_flush_dirty(&c->zio, (uint64_t)blk, (unsigned int)count);
+	int rc = zio_flush_dirty(&c->zio, (uint64_t)blk, (unsigned int)count);
+	if (rc == 0)
+		c->engine_wrote = true;
+	return rc;
 }
 
 /* Discard mode: one io_channel_discard() per whole run (no reads);
@@ -463,8 +467,7 @@ int main(int argc, char **argv)
 			argv[0], fs_path);
 		return 1;
 	}
-	sb_kbytes_written =
-		ext2fs_le32_to_cpu(c.fs->super->s_kbytes_written) != 0;
+	sb_kbytes_written = c.fs->super->s_kbytes_written != 0;
 
 	c.bs = c.fs->blocksize;
 	c.chunk_blocks = (unsigned int)(ZIO_CHUNK_BYTES / c.bs);
@@ -477,6 +480,7 @@ int main(int argc, char **argv)
 	c.free_blk = 0;
 	c.free_total = ext2fs_free_blocks_count(c.fs->super);
 	c.modified = 0;
+	c.engine_wrote = false;
 	c.total = ext2fs_blocks_count(c.fs->super);
 	c.old_percent = -1;
 	c.zero_fd = -1;
@@ -540,15 +544,14 @@ int main(int argc, char **argv)
 	if (zf_pass(&c))
 		finish(&c, 1);
 
-	/* ext2fs_close2 fsyncs the image (and updates s_wtime,
-	 * s_kbytes_written, s_checksum) only if s_kbytes_written was
+	/* ext2fs_close2 fsyncs the image only if s_kbytes_written was
 	 * non-zero at open and the io channel wrote bytes.  The engine
 	 * writes through its own fd, so libext2fs skips that path:
-	 * replicate its condition here (fsync only; the superblock
-	 * fields stay untouched, a sanctioned delta, see the spec).
-	 * fsync on the engine fd also covers zero_fd (same inode). */
-	if (!c.dryrun && !c.discard && c.modified > 0 &&
-	    sb_kbytes_written && fsync(c.zio.fd) < 0)
+	 * replicate its condition here — fsync when at least one block
+	 * went through the engine (not the offload) and the image was
+	 * pre-dirtied.  The engine fd's fsync also covers zero_fd
+	 * (same inode). */
+	if (c.engine_wrote && sb_kbytes_written && fsync(c.zio.fd) < 0)
 		fsync_err = 1;
 
 	ret = ext2fs_close(c.fs);

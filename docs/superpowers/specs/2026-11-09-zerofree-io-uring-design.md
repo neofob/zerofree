@@ -81,7 +81,9 @@ CLI/behavior contract byte-identical.
 ## Constraints (inherited, in force)
 
 - C17 (`-std=gnu17`), GCC 13, `-O3 -march=x86-64-v3 -flto -Wall -Wextra
-  -Wpedantic`; e2fsprogs ≥ 1.42 (`EXT2_FLAG_64BITS`), 64-bit fs support.
+  -Wpedantic`; e2fsprogs ≥ 1.43 (the `#error` guard tests
+  `EXT2_FLAG_64BITS`; the true minimum is `ext2fs_has_feature_bigalloc`),
+  64-bit fs support.
 - Pinned error messages: `error while reading block` /
   `error while writing block` / `error while discarding block` /
   `out of memory (surely not?)`; usage string and getopt table unchanged.
@@ -233,9 +235,11 @@ I/O protocol (pinned, from builder review 2026-11-09):
       fast (~seconds), so running it twice is cheap.
     - New unit test: in-order consumption of the uring read pipeline is
       exercised implicitly by the black-box suite (byte-exact free-block
-      checks in both modes); no fault injection for CQE errors — the
-      error path is pinned by code inspection (same convention as the
-      2026-11-08 plan's Review Focus).
+      checks in both modes); CQE error paths: the read-EOF (`res==0`)
+      and write-EBADF paths are covered by `tests/zio_test` in both
+      engine modes, the remaining CQE error classes are pinned by code
+      inspection (same convention as the 2026-11-08 plan's Review
+      Focus).
     - Bench: 4 GiB image scenarios (clean pass, dirty→0, dirty→0xBB)
       before/after, reported in the final summary.
 14. **Close-time fsync and the sanctioned superblock delta.**
@@ -247,19 +251,25 @@ I/O protocol (pinned, from builder review 2026-11-09):
        "pre-dirtied" image is one with non-zero `s_kbytes_written` (a
        kernel mount/unmount or an earlier libext2fs tool wrote it).
     2. *Consequence for this engine.* Data I/O bypasses `fs->io`, so
-       libext2fs never takes that close path. On pre-dirtied images the
-       output therefore differs from the pre-change binary in ≤12
-       superblock bytes (s_wtime, s_kbytes_written, s_checksum —
-       time-dependent, so the old output was never byte-stable on them
-       either): the **sanctioned delta**; data blocks, bitmaps and inodes
-       are always identical. On fresh images the two binaries' images are
-       byte-identical and neither fsyncs at exit (verified by syscall
-       trace: the only fsync in a run is libext2fs's open-time fsync,
-       present in both).
-    3. *The fix.* An explicit `fsync` of the engine fd under the same
-       condition the old binary took the close path (fill mode, not
-       dry-run, at least one block written, `s_kbytes_written != 0` at
-       open), after `zio_drain`, before `ext2fs_close`; failure prints the
+       libext2fs never takes that close path. On pre-dirtied images, runs
+       that write blocks through the engine fd (non-zero fill, or fill-0
+       whose offload is unavailable/fell back) therefore differ from the
+       pre-change binary in ≤12 superblock bytes (s_wtime,
+       s_kbytes_written, s_checksum — time-dependent, so the old output
+       was never byte-stable on them either): the **sanctioned delta**;
+       data blocks, bitmaps and inodes are always identical. Fill-0 runs
+       whose offload works are byte-identical to the old binary (its
+       close gate never fires), as are dry-run and discard runs. On fresh
+       images the two binaries' images are byte-identical and neither
+       fsyncs at exit (verified by syscall trace: the only fsync in a
+       run is libext2fs's open-time fsync, present in both).
+    3. *The fix.* An explicit `fsync` of the engine fd
+       when at least one block was written through the engine fd rather
+       than the offload and `s_kbytes_written != 0` at open — exactly
+       when the old binary's `fs->io` write count was non-zero and its
+       close gate fired (dry-run and discard never write through the
+       engine, so they are excluded by construction), after `zio_drain`,
+       before `ext2fs_close`; failure prints the
        pinned `error while closing filesystem` message and exits 1 (the
        old binary's message/exit for a close-time fsync failure). The
        fsync covers the zero-offload fd's writes too (same inode). On
