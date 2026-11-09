@@ -23,11 +23,15 @@ zerofree.o: zerofree.c zerofree.h
 zerofree: zerofree.o
 	@gcc $(ZF_CFLAGS) -o zerofree zerofree.o $(LIBS)
 
-unit: tests/unit_filled
+unit: tests/unit_filled tests/run_scan
 	@./tests/unit_filled
+	@./tests/run_scan
 
 tests/unit_filled: tests/unit_filled.c zerofree.h
 	@gcc $(ZF_CFLAGS) -I. -o tests/unit_filled tests/unit_filled.c
+
+tests/run_scan: tests/run_scan.c runscan.h
+	@gcc $(ZF_CFLAGS) -I. -o tests/run_scan tests/run_scan.c
 
 test: zerofree unit
 	@bash tests/test_suite.sh ./zerofree
