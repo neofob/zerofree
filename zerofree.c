@@ -7,6 +7,28 @@
  * License, version 2.
  *
  * Changes:
+ * 2026-11-08  Modern x86-64 Linux rewrite (Linux + e2fsprogs 1.42+):
+ *             - remove the threaded -t mode entirely (its per-IO global
+ *               mutex serialized all I/O anyway, and its partitioning
+ *               silently skipped boundary blocks);
+ *             - coalesce runs of consecutive free blocks into batched
+ *               multi-block reads/writes (up to 1 MiB per syscall);
+ *             - vectorized single-stream fill compare (zerofree.h),
+ *               auto-vectorized to AVX2 at -march=x86-64-v3;
+ *             - 64-bit filesystem support (EXT2_FLAG_64BITS);
+ *             - close the filesystem on I/O errors (old code leaked it);
+ *             - when the fill value is zero, dirty sub-runs are zeroed
+ *               by the kernel instead of by writing zeros:
+ *               BLKZEROOUT on block devices, fallocate(FALLOC_FL_ZERO_RANGE)
+ *               on image files.
+ *             NOTE on zero-offload: FALLOC_FL_ZERO_RANGE zeroes image-file
+ *             ranges at the extent-metadata level; the bytes read back as
+ *             zero (this tool's contract), but stale data may physically
+ *             persist in the host storage until the extents are rewritten.
+ *             BLKZEROOUT asks the device to zero sectors, which is stronger
+ *             but device-dependent.  For either, SSD/FTL remanence
+ *             applies.  Use the plain zero-write path (e.g. a non-zero -f
+ *             value) if physical overwrite is what you need.
  * 2015-10-18  Use memcmp. Suggested by Damien Clarke
  * 2014-11-23  Add thread option Tuan T. Pham
  * 2014-11-22  Fix memory leak. Tuan T. Pham
@@ -15,368 +37,428 @@
  *             Jan Krämer.
  */
 
+#define _GNU_SOURCE
+
+#include <errno.h>
 #include <ext2fs/ext2fs.h>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <unistd.h>
-#include <string.h>
 #include <stdlib.h>
-#include <pthread.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#define USAGE "usage: %s [-t count] [-n] [-v] [-d] [-f fillval] filesystem\n"
+#include "zerofree.h"
 
-pthread_barrier_t g_thread_barrier;
-pthread_mutex_t fs_mux;
-#define LOCK(x) pthread_mutex_lock(&x)
-#define UNLOCK(x) pthread_mutex_unlock(&x)
+#ifndef EXT2_FLAG_64BITS
+#error "zerofree requires e2fsprogs 1.42 or newer"
+#endif
 
-void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
-		unsigned char* empty, unsigned int fillval, int dryrun,
-		int discard, int* error);
+#define OPEN_FLAGS (EXT2_FLAG_RW | EXT2_FLAG_64BITS)
+#define USAGE "usage: %s [-n] [-v] [-d] [-f fillval] filesystem\n"
 
-struct thread_arg {
-	ext2_filsys	fs;
-	unsigned long	start_blk;
-	unsigned long 	end_blk;
-	unsigned int	fillval;
-	int		dryrun;
-	int		discard;
-	unsigned char	*empty;		/* shared by all threads */
+/* I/O is batched in chunks of at most this many bytes */
+#define CHUNK_BYTES ((size_t)1024 * 1024)
+
+enum zero_method {
+	ZERO_PWRITE,		/* write the fill buffer (always works) */
+	ZERO_RANGE,		/* fallocate(FALLOC_FL_ZERO_RANGE), files */
+	ZERO_BLKZEROOUT,	/* BLKZEROOUT ioctl, block devices */
 };
 
-void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
-		int verbose, int discard, unsigned char *empty,
-		unsigned char *buf);
+struct zf_ctx {
+	ext2_filsys	fs;
+	unsigned char	*restrict buf;	/* read buffer */
+	unsigned char	*restrict fillbuf;	/* pre-filled with fillval */
+	size_t		bs;		/* filesystem block size (bytes) */
+	unsigned int	chunk_blocks;	/* max blocks per batched I/O */
+	uint8_t		fill;
+	bool		dryrun;
+	bool		discard;
+	bool		verbose;
+	blk64_t		free_blk;
+	blk64_t		free_total;
+	blk64_t		modified;
+	blk64_t		total;
+	int		old_percent;
+	int		zero_fd;	/* side fd for zero-offload, -1 if off */
+	enum zero_method	method;
+};
 
-void* zero_thread(void* arg);
-void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
-		int dryrun, int discard, unsigned char *empty,
-		unsigned char *buf);
+static void progress(struct zf_ctx *c)
+{
+	double percent;
 
-void bailout(void* mem0, void* mem1) __attribute__ ((noreturn));
+	if (!c->verbose)
+		return;
+
+	/* Guard against an inconsistent superblock (free_total == 0):
+	 * inside the loop free_blk >= 1, so percent is 100.0. */
+	percent = 100.0 * (double)c->free_blk /
+		(double)(c->free_total ? c->free_total : c->free_blk);
+	if ((int)(percent * 10) != c->old_percent) {
+		fprintf(stderr, "\r%4.1f%%", percent);
+		c->old_percent = (int)(percent * 10);
+	}
+}
+
+/*
+ * Ask the kernel to zero blocks [blk, blk+count) without transferring
+ * data.  Returns 0 on success, 1 if the device/file system does not
+ * support it (caller falls back to the fill-buffer write permanently),
+ * 2 on a real I/O error.
+ */
+static int zero_range(struct zf_ctx *c, blk64_t blk, blk64_t count)
+{
+	const off_t off = (off_t)blk * c->bs;
+	const off_t len = (off_t)count * c->bs;
+	int err;
+
+	if (c->method == ZERO_BLKZEROOUT) {
+		struct {
+			__u64	length;
+			__u64	start;
+		} range = { .length = (__u64)len, .start = (__u64)off };
+
+		if (ioctl(c->zero_fd, BLKZEROOUT, &range) == 0)
+			return 0;
+		err = errno;
+	} else {
+		if (fallocate(c->zero_fd, FALLOC_FL_ZERO_RANGE, off, len) == 0)
+			return 0;
+		err = errno;
+	}
+
+	switch (err) {
+	case EOPNOTSUPP:
+	case ENOSYS:
+	case ENOTTY:
+	case EINVAL:
+		return 1;
+	default:
+		return 2;
+	}
+}
+
+/* Zero one dirty sub-run; writes the fill buffer when offload is off. */
+static int flush_dirty(struct zf_ctx *c, blk64_t blk, blk64_t count)
+{
+	errcode_t ret;
+
+	if (c->method != ZERO_PWRITE) {
+		int rc = zero_range(c, blk, count);
+		if (rc == 1) {	/* unsupported: fall back permanently */
+			c->method = ZERO_PWRITE;
+			if (c->zero_fd >= 0)
+				close(c->zero_fd);
+			c->zero_fd = -1;
+		} else if (rc == 2)
+			return 1;
+		else
+			return 0;
+	}
+
+	ret = io_channel_write_blk64(c->fs->io, blk, (int)count, c->fillbuf);
+	return ret != 0;
+}
+
+static int read_piece(struct zf_ctx *c, blk64_t blk, unsigned int count)
+{
+	errcode_t ret = io_channel_read_blk64(c->fs->io, blk, count, c->buf);
+	if (ret) {
+		fprintf(stderr, "error while reading block\n");
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * The main pass: scan the block bitmap and process maximal runs of
+ * consecutive free blocks.
+ *
+ *   discard mode:  one io_channel_discard() per whole run (no reads);
+ *                  every block in the run counts as modified.
+ *   fill mode:     read each run in <= chunk_blocks pieces (one syscall
+ *                  per piece), find the dirty blocks inside, and write
+ *                  each maximal dirty sub-run with one syscall (or one
+ *                  kernel zero-offload call when fill == 0).
+ *
+ * Only free blocks whose content differs from the fill value are
+ * written, so sparse image files stay sparse and a second run does
+ * no work.  In dry-run nothing is written or discarded, but the work
+ * that would have been done is still counted.
+ */
+static int zf_pass(struct zf_ctx *c)
+{
+	blk64_t blk = c->fs->super->s_first_data_block;
+	blk64_t blocks_count = ext2fs_blocks_count(c->fs->super);
+
+	if (c->verbose)
+		fprintf(stderr, "\r%4.1f%%", 0.0);
+
+	while (blk < blocks_count) {
+		blk64_t run_start, run_len, pos, remaining;
+		unsigned int chunk;
+		size_t nb, i;
+
+		if (ext2fs_test_block_bitmap2(c->fs->block_map, blk)) {
+			blk++;		/* in use */
+			continue;
+		}
+
+		/* maximal run of consecutive free blocks */
+		run_start = blk;
+		run_len = 0;
+		while (blk < blocks_count &&
+		       !ext2fs_test_block_bitmap2(c->fs->block_map, blk)) {
+			blk++;
+			run_len++;
+		}
+
+		if (c->discard) {
+			errcode_t ret = 0;
+
+			if (!c->dryrun)
+				ret = io_channel_discard(c->fs->io,
+							 run_start, run_len);
+			for (i = 0; i < (size_t)run_len; i++) {
+				c->free_blk++;
+				c->modified++;
+				progress(c);
+			}
+			if (ret) {
+				fprintf(stderr, "error while discarding block\n");
+				return 1;
+			}
+			continue;
+		}
+
+		/* fill mode: read the run in chunks, flush the dirty
+		 * sub-runs */
+		pos = run_start;
+		remaining = run_len;
+		while (remaining > 0) {
+			chunk = c->chunk_blocks;
+			if ((blk64_t)chunk > remaining)
+				chunk = (unsigned int)remaining;
+
+			if (read_piece(c, pos, chunk))
+				return 1;
+
+			/* find and flush maximal dirty sub-runs */
+			nb = 0;
+			while (nb < chunk) {
+				if (zf_block_is_filled(c->buf + nb * c->bs,
+						       c->bs, c->fill)) {
+					nb++;
+					continue;
+				}
+
+				i = nb;
+				while (i < chunk &&
+				       !zf_block_is_filled(c->buf + i * c->bs,
+							   c->bs, c->fill))
+					i++;
+
+				if (!c->dryrun &&
+				    flush_dirty(c, pos + nb, (blk64_t)(i - nb))) {
+					fprintf(stderr,
+						"error while writing block\n");
+					return 1;
+				}
+				c->modified += (blk64_t)(i - nb);
+				nb = i;
+			}
+
+			for (i = 0; i < chunk; i++) {
+				c->free_blk++;
+				progress(c);
+			}
+
+			pos += chunk;
+			remaining -= chunk;
+		}
+	}
+
+	if (c->verbose)
+		printf("\r%llu/%llu/%llu\n",
+		       (unsigned long long)c->modified,
+		       (unsigned long long)c->free_blk,
+		       (unsigned long long)c->total);
+	return 0;
+}
+
+/*
+ * Open a side file descriptor for kernel zero-offload, when applicable.
+ * Coherency: offloaded ranges are free data blocks only; libext2fs's
+ * I/O cache holds metadata (superblock, bitmaps, group descriptors),
+ * the scan is forward-only, and ext2fs_close() writes back only dirty
+ * metadata -- so offloaded ranges are never cached, revisited, or
+ * clobbered.  Any failure simply disables offload; behavior is
+ * unchanged.
+ */
+static void offload_init(struct zf_ctx *c, const char *path)
+{
+	struct stat st;
+	int fd;
+
+	if (c->fill != 0 || c->dryrun || c->discard)
+		return;
+
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	if (fstat(fd, &st) != 0) {
+		close(fd);
+		return;
+	}
+	if (S_ISREG(st.st_mode))
+		c->method = ZERO_RANGE;
+	else if (S_ISBLK(st.st_mode))
+		c->method = ZERO_BLKZEROOUT;
+	else {
+		close(fd);
+		return;
+	}
+	c->zero_fd = fd;
+}
+
+/* Error path: close everything (the old code leaked the open
+ * filesystem on I/O errors) and exit.  Metadata is untouched by this
+ * tool, so closing cannot clobber anything; ignore its return value. */
+static void __attribute__((noreturn))
+finish(const struct zf_ctx *c, int rc)
+{
+	ext2fs_close(c->fs);
+	if (c->zero_fd >= 0)
+		close(c->zero_fd);
+	free(c->buf);
+	free(c->fillbuf);
+	exit(rc);
+}
 
 int main(int argc, char **argv)
 {
 	errcode_t ret;
 	int flags;
-	int superblock = 0;
-	int open_flags = EXT2_FLAG_RW;
-	int blocksize = 0;
-	ext2_filsys fs = NULL;
-	unsigned long blk;
-	unsigned char *buf;
-	unsigned char *empty;
-	int i, c;
+	int c_opt;
 	unsigned int fillval = 0;
-	int verbose = 0;
-	int dryrun = 0;
-	int discard = 0;
-	long thread_count = 1;
+	bool verbose = false;
+	bool dryrun = false;
+	bool discard = false;
+	const char *fs_path;
+	struct zf_ctx c;
 
-	while ( (c=getopt(argc, argv, "t:nvdf:")) != -1 ) {
-		switch (c) {
-		case 't':
-			{
-				char *endptr;
-				thread_count = strtol(optarg, &endptr, 0);
-				if (!*optarg || *endptr || thread_count < 0) {
-					fprintf(stderr, "%s: invalid argument"
-						" to -t\n", argv[0]);
-					return 1;
-				}
-				fprintf(stderr, "USE %d threads\n", thread_count);
-				fprintf(stderr, "WARNING: Running multiple threads"
-					" might damage your spinning device!\n");
-			}
+	while ((c_opt = getopt(argc, argv, "nvdf:")) != -1) {
+		switch (c_opt) {
+		case 'n':
+			dryrun = true;
 			break;
-		case 'n' :
-			dryrun = 1;
-			break;
-		case 'v' :
-			verbose = 1;
+		case 'v':
+			verbose = true;
 			break;
 		case 'd':
-			discard = 1;
+			discard = true;
 			break;
-		case 'f' :
+		case 'f':
 			{
 				char *endptr;
-				fillval = strtol(optarg, &endptr, 0);
-				if ( !*optarg || *endptr ) {
-					fprintf(stderr, "%s: invalid argument to -f\n", argv[0]);
-					return 1;
-				} else if ( fillval > 0xFFu ) {
-					fprintf(stderr, "%s: fill value must be 0-255\n", argv[0]);
+				long v = strtol(optarg, &endptr, 0);
+				/* base 0: "010" is octal 8, as before */
+				if (!*optarg || *endptr || v < 0 ||
+				    (unsigned int)v > 0xFFu) {
+					fprintf(stderr,
+						"%s: fill value must be 0-255\n",
+						argv[0]);
 					return 1;
 				}
-				printf("fillval = %d\n", fillval);
+				fillval = (unsigned int)v;
+				printf("fillval = %u\n", fillval);
 			}
 			break;
-		default :
+		default:
 			fprintf(stderr, USAGE, argv[0]);
 			return 1;
 		}
 	}
 
-	if ( argc != optind+1 ) {
+	if (argc != optind + 1) {
 		fprintf(stderr, USAGE, argv[0]);
 		return 1;
 	}
+	fs_path = argv[optind];
 
-	ret = ext2fs_check_if_mounted(argv[optind], &flags);
-	if ( ret ) {
-		fprintf(stderr, "%s: failed to determine filesystem mount state  %s\n",
-			argv[0], argv[optind]);
+	ret = ext2fs_check_if_mounted(fs_path, &flags);
+	if (ret) {
+		fprintf(stderr,
+			"%s: failed to determine filesystem mount state  %s\n",
+			argv[0], fs_path);
 		return 1;
 	}
-
-	if ( (flags & EXT2_MF_MOUNTED) && !(flags & EXT2_MF_READONLY) ) {
+	if ((flags & EXT2_MF_MOUNTED) && !(flags & EXT2_MF_READONLY)) {
 		fprintf(stderr, "%s: filesystem %s is mounted rw\n",
-			argv[0], argv[optind]);
+			argv[0], fs_path);
 		return 1;
 	}
 
-	ret = ext2fs_open(argv[optind], open_flags, superblock, blocksize,
-							unix_io_manager, &fs);
-	if ( ret ) {
+	ret = ext2fs_open(fs_path, OPEN_FLAGS, 0, 0, unix_io_manager, &c.fs);
+	if (ret) {
 		fprintf(stderr, "%s: failed to open filesystem %s\n",
-			argv[0], argv[optind]);
+			argv[0], fs_path);
 		return 1;
 	}
 
-	empty = (unsigned char *)malloc(fs->blocksize);
-	buf = (unsigned char *)malloc(fs->blocksize);
-
-	if ( empty == NULL || buf == NULL ) {
+	c.buf = aligned_alloc(4096, CHUNK_BYTES);
+	c.fillbuf = aligned_alloc(4096, CHUNK_BYTES);
+	if (c.buf == NULL || c.fillbuf == NULL) {
 		fprintf(stderr, "%s: out of memory (surely not?)\n", argv[0]);
-		bailout((void*) empty, (void*) buf);
+		free(c.buf);
+		free(c.fillbuf);
+		ext2fs_close(c.fs);
+		return 1;
 	}
 
-	memset(empty, fillval, fs->blocksize);
+	c.bs = c.fs->blocksize;
+	c.chunk_blocks = (unsigned int)(CHUNK_BYTES / c.bs);
+	if (c.chunk_blocks < 1)
+		c.chunk_blocks = 1;
+	c.fill = (uint8_t)fillval;
+	c.dryrun = dryrun;
+	c.discard = discard;
+	c.verbose = verbose;
+	c.free_blk = 0;
+	c.free_total = ext2fs_free_blocks_count(c.fs->super);
+	c.modified = 0;
+	c.total = ext2fs_blocks_count(c.fs->super);
+	c.old_percent = -1;
+	c.zero_fd = -1;
+	c.method = ZERO_PWRITE;
+	memset(c.fillbuf, fillval, CHUNK_BYTES);
 
-	ret = ext2fs_read_block_bitmap(fs);
-	if ( ret ) {
-		fprintf(stderr, "%s: error while reading block bitmap\n", argv[0]);
-		bailout((void*) empty, (void*) buf);
+	offload_init(&c, fs_path);
+
+	ret = ext2fs_read_block_bitmap(c.fs);
+	if (ret) {
+		fprintf(stderr, "%s: error while reading block bitmap\n",
+			argv[0]);
+		finish(&c, 1);
 	}
 
-	if (thread_count == 1) {
-		single_thread(fs, fillval, dryrun, verbose, discard, empty, buf);
-	}
-	else {
-		multi_thread(fs, thread_count, fillval, dryrun, discard, empty, buf);
-	}
+	if (zf_pass(&c))
+		finish(&c, 1);
 
-	ret = ext2fs_close(fs);
-	if ( ret ) {
-		fprintf(stderr, "%s: error while closing filesystem\n", argv[0]);
-		bailout((void*) empty, (void*) buf);
+	ret = ext2fs_close(c.fs);
+	if (c.zero_fd >= 0)
+		close(c.zero_fd);
+	free(c.buf);
+	free(c.fillbuf);
+	if (ret) {
+		fprintf(stderr, "%s: error while closing filesystem\n",
+			argv[0]);
+		return 1;
 	}
-
-	free(buf);
-	free(empty);
 	return 0;
-}
-
-void bailout(void* mem0, void* mem1)
-{
-	if (mem0) {
-		free(mem0);
-	}
-
-	if (mem1) {
-		free(mem1);
-	}
-
-	exit(1);
-}
-
-void multi_thread(ext2_filsys fs, long thread_count, unsigned int fillval,
-		int dryrun, int discard, unsigned char *empty,
-		unsigned char *buf)
-{
-	int 			i, ret;
-	pthread_t		*tid_array;
-	struct thread_arg	*arg_array;
-	unsigned long		blk, part_size, pivot;
-	int			error = 0;
-
-	tid_array = malloc(sizeof(pthread_t)*thread_count);
-	arg_array = malloc(sizeof(struct thread_arg)*thread_count);
-
-	pthread_barrier_init(&g_thread_barrier, NULL, thread_count+1);
-	pthread_mutex_init(&fs_mux, NULL);
-
-	pivot = fs->super->s_first_data_block;
-	part_size = (fs->super->s_blocks_count - fs->super->s_first_data_block)
-			/thread_count;
-
-	for (i=0; i < thread_count; i++) {
-		arg_array[i].fs = fs;
-		arg_array[i].start_blk = pivot;
-		arg_array[i].end_blk = part_size*(i+1);
-		arg_array[i].fillval = fillval;
-		arg_array[i].dryrun = dryrun;
-		arg_array[i].discard = discard;
-		arg_array[i].empty = empty;
-
-		pivot += part_size;
-
-		ret = pthread_create(&tid_array[i], NULL, zero_thread,
-					&arg_array[i]);
-	}
-
-	/* process the remaining blocks */
-	if (pivot < fs->super->s_blocks_count) {
-		for (blk = pivot; blk < fs->super->s_blocks_count; blk++)
-		{
-			zero_func(fs, blk, buf, empty, fillval, dryrun,
-				discard, &error);
-		}
-	}
-
-	pthread_barrier_wait(&g_thread_barrier);
-	for (i=0; i < thread_count; i++) {
-		pthread_join(tid_array[i], NULL);
-	}
-
-	free(tid_array);
-	free(arg_array);
-}
-
-inline void zero_func(ext2_filsys fs, unsigned long blk, unsigned char* buf,
-		unsigned char* empty, unsigned int fillval, int dryrun,
-		int discard, int *error)
-{
-	int ret, i;
-	if ( ext2fs_test_block_bitmap(fs->block_map, blk) ) {
-		goto _exit;
-	}
-
-	if (!discard) {
-		LOCK(fs_mux);
-		ret = io_channel_read_blk(fs->io, blk, 1, buf);
-		UNLOCK(fs_mux);
-		if ( ret ) {
-			fprintf(stderr, "error while reading block\n");
-			*error = 1;
-			goto _exit;
-		}
-
-		ret = memcmp(buf, empty, fs->blocksize);
-		if ( 0 == ret )
-			goto _exit;
-	}
-
-	if ( !dryrun ) {
-		if (!discard) {
-			LOCK(fs_mux);
-			ret = io_channel_write_blk(fs->io, blk, 1, empty);
-			UNLOCK(fs_mux);
-			if ( ret ) {
-				fprintf(stderr, "error while writing block\n");
-				*error = 1;
-				goto _exit;
-			}
-		} else { /* discard */
-			LOCK(fs_mux);
-			ret = io_channel_discard(fs->io, blk, 1);
-			UNLOCK(fs_mux);
-			if ( ret ) {
-				fprintf(stderr, "error while discarding block\n");
-				*error = 1;
-				goto _exit;
-			}
-		}
-	}
-_exit:
-	return; /* This is to suppress gcc warning */
-}
-
-void* zero_thread(void* arg)
-{
-	struct thread_arg m_arg = *(struct thread_arg*) arg;
-	unsigned char *buf;
-	unsigned long blk;
-	int	error = 0;
-
-	buf = (unsigned char*) malloc(m_arg.fs->blocksize);
-
-	for (blk = m_arg.start_blk; blk < m_arg.end_blk; blk++) {
-		zero_func(m_arg.fs, blk, buf, m_arg.empty, m_arg.fillval,
-				m_arg.dryrun, m_arg.discard, &error);
-		if (error) {
-			break;
-		}
-	}
-
-	free(buf);
-	pthread_barrier_wait(&g_thread_barrier);
-	return (void*) ((unsigned long) error);
-}
-
-void single_thread(ext2_filsys fs, unsigned int fillval, int dryrun,
-		int verbose, int discard, unsigned char *empty,
-		unsigned char *buf)
-{
-	unsigned long	blk, free_blk, modified;
-	double		percent;
-	int		old_percent, ret, i;
-
-	free_blk = modified = 0;
-	percent = 0.0;
-	old_percent = -1;
-
-	if ( verbose ) {
-		fprintf(stderr, "\r%4.1f%%", percent);
-	}
-
-	for ( blk=fs->super->s_first_data_block;
-		blk < fs->super->s_blocks_count; blk++ ) {
-
-		if ( ext2fs_test_block_bitmap(fs->block_map, blk) ) {
-			continue;
-		}
-
-		++free_blk;
-		percent = 100.0 * (double)free_blk/
-					(double)fs->super->s_free_blocks_count;
-
-		if ( verbose && (int)(percent*10) != old_percent ) {
-			fprintf(stderr, "\r%4.1f%%", percent);
-			old_percent = (int)(percent*10);
-		}
-
-		if (!discard) {
-			ret = io_channel_read_blk(fs->io, blk, 1, buf);
-			if ( ret ) {
-				fprintf(stderr, "error while reading block\n");
-				bailout((void*) empty, (void*) buf);
-			}
-			ret = memcmp(buf, empty, fs->blocksize);
-			if ( 0 == ret )
-				continue;
-		}
-
-		++modified;
-
-		if ( !dryrun ) {
-			if (!discard) {
-				ret = io_channel_write_blk(fs->io, blk, 1, empty);
-				if ( ret ) {
-					fprintf(stderr, "error while writing block\n");
-					bailout((void*) empty, (void*) buf);
-				}
-			} else { /* discard */
-				ret = io_channel_discard(fs->io, blk, 1);
-				if ( ret ) {
-					fprintf(stderr, " error while discarding block\n");
-					bailout((void*) empty, (void*) buf);
-				}
-			}
-		}
-	}
-
-	if ( verbose ) {
-		printf("\r%u/%u/%u\n", modified, free_blk, fs->super->s_blocks_count);
-	}
 }
