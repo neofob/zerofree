@@ -125,6 +125,8 @@ int main(int argc, char **argv)
 	CHECK(z.fd >= 0);
 	if (want_sync) {
 		CHECK(z.use_uring == false);
+		if (zio_read(&z) != NULL)
+			fail("unprimed zio_read returned a buffer");
 	} else if (!z.use_uring) {
 		printf("SKIP: zio_test (no io_uring)\n");
 		zio_close(&z);

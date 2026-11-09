@@ -55,6 +55,11 @@ void zio_close(struct zio *z)
 
 	close(z->fd);
 	z->fd = -1;
+	z->use_uring = false;
+	z->bs = 0;
+	z->pending_blk = 0;
+	z->pending_count = 0;
+	z->done = 0;
 }
 
 void zio_prime(struct zio *z, uint64_t blk, unsigned int count)
@@ -69,12 +74,17 @@ unsigned char *zio_read(struct zio *z)
 	size_t len = (size_t)z->pending_count * z->bs;
 	off_t base = (off_t)(z->pending_blk * z->bs);
 
+	if (!z->use_uring && z->pending_count == 0) {
+		fputs("error while reading block\n", stderr);
+		return NULL;
+	}
+
 	z->done = 0;
 	while (z->done < len) {
 		ssize_t r = pread(z->fd, buf + z->done, len - z->done,
 				  base + (off_t)z->done);
 
-		if (r < 0 && errno == EINTR)
+		if (r < 0 && (errno == EINTR || errno == EAGAIN))
 			continue;
 		if (r <= 0) {
 			fputs("error while reading block\n", stderr);
@@ -95,7 +105,7 @@ int zio_flush_dirty(struct zio *z, uint64_t blk, unsigned int count)
 		ssize_t r = pwrite(z->fd, z->fillbuf + z->done, len - z->done,
 				   base + (off_t)z->done);
 
-		if (r < 0 && errno == EINTR)
+		if (r < 0 && (errno == EINTR || errno == EAGAIN))
 			continue;
 		if (r <= 0) {
 			fputs("error while writing block\n", stderr);
