@@ -17,11 +17,16 @@ all: sparsify zerofree
 sparsify: sparsify.o
 	@gcc -c -o sparsify.o sparsify.c
 
-zerofree.o: zerofree.c zerofree.h
+ZEROFREE_OBJS = zerofree.o zio.o
+
+zerofree.o: zerofree.c zerofree.h zio.h runscan.h
 	@gcc $(ZF_CFLAGS) -c -o zerofree.o zerofree.c
 
-zerofree: zerofree.o
-	@gcc $(ZF_CFLAGS) -o zerofree zerofree.o $(LIBS)
+zio.o: zio.c zio.h
+	@gcc $(ZF_CFLAGS) -c -o zio.o zio.c
+
+zerofree: $(ZEROFREE_OBJS)
+	@gcc $(ZF_CFLAGS) -o zerofree $(ZEROFREE_OBJS) $(LIBS)
 
 unit: tests/unit_filled tests/run_scan tests/zio_test
 	@./tests/unit_filled
@@ -40,6 +45,7 @@ tests/zio_test: tests/zio_test.c zio.c zio.h
 
 test: zerofree unit
 	@bash tests/test_suite.sh ./zerofree
+	@ZEROFREE_NO_URING=1 bash tests/test_suite.sh ./zerofree
 
 tags:$(wildcard *.c)
 	@ctags *.c

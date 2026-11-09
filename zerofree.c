@@ -51,7 +51,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "runscan.h"
 #include "zerofree.h"
+#include "zio.h"
 
 #ifndef EXT2_FLAG_64BITS
 #error "zerofree requires e2fsprogs 1.42 or newer"
@@ -59,9 +61,6 @@
 
 #define OPEN_FLAGS (EXT2_FLAG_RW | EXT2_FLAG_64BITS)
 #define USAGE "usage: %s [-n] [-v] [-d] [-f fillval] filesystem\n"
-
-/* I/O is batched in chunks of at most this many bytes */
-#define CHUNK_BYTES ((size_t)1024 * 1024)
 
 enum zero_method {
 	ZERO_PWRITE,		/* write the fill buffer (always works) */
@@ -71,8 +70,9 @@ enum zero_method {
 
 struct zf_ctx {
 	ext2_filsys	fs;
-	unsigned char	*restrict buf;	/* read buffer */
-	unsigned char	*restrict fillbuf;	/* pre-filled with fillval */
+	struct zio	zio;		/* data I/O engine (fill mode only) */
+	unsigned char	*fmap;		/* free-block map: bit i = block
+					 * s_first_data_block + i, set = used */
 	size_t		bs;		/* filesystem block size (bytes) */
 	unsigned int	chunk_blocks;	/* max blocks per batched I/O */
 	uint8_t		fill;
@@ -143,11 +143,12 @@ static int zero_range(struct zf_ctx *c, blk64_t blk, blk64_t count)
 	}
 }
 
-/* Zero one dirty sub-run; writes the fill buffer when offload is off. */
+/* Zero one dirty sub-run; writes the fill buffer when offload is off.
+ * On any failure prints the pinned "error while writing block" exactly
+ * once and returns 1.  The engine prints it on the pwrite path; we print
+ * it here only for the offload path, which the engine never sees. */
 static int flush_dirty(struct zf_ctx *c, blk64_t blk, blk64_t count)
 {
-	errcode_t ret;
-
 	if (c->method != ZERO_PWRITE) {
 		int rc = zero_range(c, blk, count);
 		if (rc == 1) {	/* unsupported: fall back permanently */
@@ -155,103 +156,118 @@ static int flush_dirty(struct zf_ctx *c, blk64_t blk, blk64_t count)
 			if (c->zero_fd >= 0)
 				close(c->zero_fd);
 			c->zero_fd = -1;
-		} else if (rc == 2)
+			/* fall through to the engine write below */
+		} else if (rc == 2) {
+			fprintf(stderr, "error while writing block\n");
 			return 1;
-		else
+		} else
 			return 0;
 	}
 
-	ret = io_channel_write_blk64(c->fs->io, blk, (int)count, c->fillbuf);
-	return ret != 0;
+	return zio_flush_dirty(&c->zio, (uint64_t)blk, (unsigned int)count);
 }
 
-static int read_piece(struct zf_ctx *c, blk64_t blk, unsigned int count)
+/* Discard mode: one io_channel_discard() per whole run (no reads);
+ * every block in the run counts as modified. */
+static int zf_pass_discard(struct zf_ctx *c, struct run_it *it)
 {
-	errcode_t ret = io_channel_read_blk64(c->fs->io, blk, count, c->buf);
-	if (ret) {
-		fprintf(stderr, "error while reading block\n");
-		return 1;
+	uint64_t run_start, run_len;
+
+	while (next_run(it, &run_start, &run_len) == 0) {
+		errcode_t ret = 0;
+		size_t i;
+
+		run_start += c->fs->super->s_first_data_block;
+		if (!c->dryrun)
+			ret = io_channel_discard(c->fs->io, run_start, run_len);
+		for (i = 0; i < (size_t)run_len; i++) {
+			c->free_blk++;
+			c->modified++;
+			progress(c);
+		}
+		if (ret) {
+			fprintf(stderr, "error while discarding block\n");
+			return 1;
+		}
 	}
 	return 0;
 }
 
+/* One primed read: blocks [blk, blk+count). */
+struct zf_work {
+	uint64_t	blk;
+	unsigned int	count;
+};
+
 /*
- * The main pass: scan the block bitmap and process maximal runs of
- * consecutive free blocks.
+ * Fill mode: a software pipeline over the free runs.
  *
- *   discard mode:  one io_channel_discard() per whole run (no reads);
- *                  every block in the run counts as modified.
- *   fill mode:     read each run in <= chunk_blocks pieces (one syscall
- *                  per piece), find the dirty blocks inside, and write
- *                  each maximal dirty sub-run with one syscall (or one
- *                  kernel zero-offload call when fill == 0).
- *
- * Only free blocks whose content differs from the fill value are
- * written, so sparse image files stay sparse and a second run does
- * no work.  In dry-run nothing is written or discarded, but the work
- * that would have been done is still counted.
+ * Invariants:
+ *  - at most ZIO_MAX_SLOTS reads are primed ahead of the consume point
+ *    (nwin <= depth <= ZIO_MAX_SLOTS), as the engine requires; depth is
+ *    1 in the synchronous engine, which has a single slot;
+ *  - reads are consumed strictly in submission order (zio_read enforces
+ *    it), so chunks are processed, and progress is reported, in
+ *    ascending block order exactly as the old per-block scan did;
+ *  - a prime never crosses a run boundary (it is clamped to run_end),
+ *    but the window as a whole does span runs;
+ *  - a returned buffer must be fully consumed before the next zio_prime
+ *    that could reuse its slot: zio_read of seq N frees slot N&7 for the
+ *    prime of seq N+8, which only happens after this chunk is done.
  */
-static int zf_pass(struct zf_ctx *c)
+static int zf_pass_fill(struct zf_ctx *c, struct run_it *it)
 {
-	blk64_t blk = c->fs->super->s_first_data_block;
-	blk64_t blocks_count = ext2fs_blocks_count(c->fs->super);
+	struct zf_work win[ZIO_MAX_SLOTS];
+	unsigned int head = 0, nwin = 0;
+	bool have_run = false, no_more = false;
+	uint64_t run_pos = 0, run_end = 0;
+	/* The sync engine has one slot buffer and remembers a single primed
+	 * read, so it must be primed and read in lockstep (depth 1). */
+	const unsigned int depth = c->zio.use_uring ? ZIO_MAX_SLOTS : 1;
 
-	if (c->verbose)
-		fprintf(stderr, "\r%4.1f%%", 0.0);
+	for (;;) {
+		/* window_fill */
+		while (nwin < depth && !no_more) {
+			uint64_t chunk;
 
-	while (blk < blocks_count) {
-		blk64_t run_start, run_len, pos, remaining;
-		unsigned int chunk;
-		size_t nb, i;
+			if (!have_run || run_pos >= run_end) {
+				uint64_t start, len;
 
-		if (ext2fs_test_block_bitmap2(c->fs->block_map, blk)) {
-			blk++;		/* in use */
-			continue;
-		}
-
-		/* maximal run of consecutive free blocks */
-		run_start = blk;
-		run_len = 0;
-		while (blk < blocks_count &&
-		       !ext2fs_test_block_bitmap2(c->fs->block_map, blk)) {
-			blk++;
-			run_len++;
-		}
-
-		if (c->discard) {
-			errcode_t ret = 0;
-
-			if (!c->dryrun)
-				ret = io_channel_discard(c->fs->io,
-							 run_start, run_len);
-			for (i = 0; i < (size_t)run_len; i++) {
-				c->free_blk++;
-				c->modified++;
-				progress(c);
+				if (next_run(it, &start, &len) != 0) {
+					no_more = true;
+					break;
+				}
+				run_pos = start + c->fs->super->s_first_data_block;
+				run_end = run_pos + len;
+				have_run = true;
 			}
-			if (ret) {
-				fprintf(stderr, "error while discarding block\n");
-				return 1;
-			}
-			continue;
+			chunk = run_end - run_pos;
+			if (chunk > c->chunk_blocks)
+				chunk = c->chunk_blocks;
+
+			win[(head + nwin) % ZIO_MAX_SLOTS] =
+				(struct zf_work){ run_pos, (unsigned int)chunk };
+			nwin++;
+			zio_prime(&c->zio, run_pos, (unsigned int)chunk);
+			run_pos += chunk;
 		}
 
-		/* fill mode: read the run in chunks, flush the dirty
-		 * sub-runs */
-		pos = run_start;
-		remaining = run_len;
-		while (remaining > 0) {
-			chunk = c->chunk_blocks;
-			if ((blk64_t)chunk > remaining)
-				chunk = (unsigned int)remaining;
+		if (nwin == 0)
+			break;
 
-			if (read_piece(c, pos, chunk))
+		{
+			const unsigned char *buf = zio_read(&c->zio);
+			uint64_t blk = win[head].blk;
+			unsigned int chunk = win[head].count;
+			size_t nb, i;
+
+			if (!buf)
 				return 1;
 
 			/* find and flush maximal dirty sub-runs */
 			nb = 0;
 			while (nb < chunk) {
-				if (zf_block_is_filled(c->buf + nb * c->bs,
+				if (zf_block_is_filled(buf + nb * c->bs,
 						       c->bs, c->fill)) {
 					nb++;
 					continue;
@@ -259,16 +275,13 @@ static int zf_pass(struct zf_ctx *c)
 
 				i = nb;
 				while (i < chunk &&
-				       !zf_block_is_filled(c->buf + i * c->bs,
+				       !zf_block_is_filled(buf + i * c->bs,
 							   c->bs, c->fill))
 					i++;
 
 				if (!c->dryrun &&
-				    flush_dirty(c, pos + nb, (blk64_t)(i - nb))) {
-					fprintf(stderr,
-						"error while writing block\n");
+				    flush_dirty(c, blk + nb, (blk64_t)(i - nb)))
 					return 1;
-				}
 				c->modified += (blk64_t)(i - nb);
 				nb = i;
 			}
@@ -278,10 +291,48 @@ static int zf_pass(struct zf_ctx *c)
 				progress(c);
 			}
 
-			pos += chunk;
-			remaining -= chunk;
+			head = (head + 1) % ZIO_MAX_SLOTS;
+			nwin--;
 		}
 	}
+
+	if (zio_drain(&c->zio))
+		return 1;
+	return 0;
+}
+
+/*
+ * The main pass: process maximal runs of consecutive free blocks.
+ *
+ *   discard mode:  one io_channel_discard() per whole run (no reads);
+ *                  every block in the run counts as modified.
+ *   fill mode:     read each run in <= chunk_blocks pieces (pipelined,
+ *                  up to ZIO_MAX_SLOTS ahead), find the dirty blocks
+ *                  inside, and write each maximal dirty sub-run with one
+ *                  write (or one kernel zero-offload call when fill == 0).
+ *
+ * Only free blocks whose content differs from the fill value are
+ * written, so sparse image files stay sparse and a second run does
+ * no work.  In dry-run nothing is written or discarded, but the work
+ * that would have been done is still counted.
+ */
+static int zf_pass(struct zf_ctx *c)
+{
+	struct run_it it;
+	int rc;
+
+	/* fmap bit i is block s_first_data_block + i (see main), so the
+	 * iterator yields offsets that the mode functions rebase. */
+	run_it_init(&it, c->fmap, 0,
+		    ext2fs_blocks_count(c->fs->super) -
+		    c->fs->super->s_first_data_block);
+
+	if (c->verbose)
+		fprintf(stderr, "\r%4.1f%%", 0.0);
+
+	rc = c->discard ? zf_pass_discard(c, &it) : zf_pass_fill(c, &it);
+	if (rc)
+		return 1;
 
 	if (c->verbose)
 		printf("\r%llu/%llu/%llu\n",
@@ -330,13 +381,13 @@ static void offload_init(struct zf_ctx *c, const char *path)
  * filesystem on I/O errors) and exit.  Metadata is untouched by this
  * tool, so closing cannot clobber anything; ignore its return value. */
 static void __attribute__((noreturn))
-finish(const struct zf_ctx *c, int rc)
+finish(struct zf_ctx *c, int rc)
 {
 	ext2fs_close(c->fs);
 	if (c->zero_fd >= 0)
 		close(c->zero_fd);
-	free(c->buf);
-	free(c->fillbuf);
+	zio_close(&c->zio);
+	free(c->fmap);
 	exit(rc);
 }
 
@@ -411,18 +462,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	c.buf = aligned_alloc(4096, CHUNK_BYTES);
-	c.fillbuf = aligned_alloc(4096, CHUNK_BYTES);
-	if (c.buf == NULL || c.fillbuf == NULL) {
-		fprintf(stderr, "%s: out of memory (surely not?)\n", argv[0]);
-		free(c.buf);
-		free(c.fillbuf);
-		ext2fs_close(c.fs);
-		return 1;
-	}
-
 	c.bs = c.fs->blocksize;
-	c.chunk_blocks = (unsigned int)(CHUNK_BYTES / c.bs);
+	c.chunk_blocks = (unsigned int)(ZIO_CHUNK_BYTES / c.bs);
 	if (c.chunk_blocks < 1)
 		c.chunk_blocks = 1;
 	c.fill = (uint8_t)fillval;
@@ -436,7 +477,8 @@ int main(int argc, char **argv)
 	c.old_percent = -1;
 	c.zero_fd = -1;
 	c.method = ZERO_PWRITE;
-	memset(c.fillbuf, fillval, CHUNK_BYTES);
+	c.zio.fd = -1;
+	c.fmap = NULL;
 
 	offload_init(&c, fs_path);
 
@@ -447,14 +489,49 @@ int main(int argc, char **argv)
 		finish(&c, 1);
 	}
 
+	/* The bitmap type is opaque in the public header, so take a copy of
+	 * its bits for [s_first_data_block, blocks_count) for the word scan. */
+	{
+		blk64_t first = c.fs->super->s_first_data_block;
+		blk64_t nbits = c.total > first ? c.total - first : 0;
+
+		c.fmap = calloc((size_t)((nbits + 7) / 8) + 8, 1);
+		if (c.fmap == NULL) {
+			fprintf(stderr, "%s: out of memory (surely not?)\n",
+				argv[0]);
+			finish(&c, 1);
+		}
+		if (nbits &&
+		    ext2fs_get_block_bitmap_range2(c.fs->block_map, first,
+						   nbits, c.fmap)) {
+			fprintf(stderr, "%s: error while reading block bitmap\n",
+				argv[0]);
+			finish(&c, 1);
+		}
+	}
+
+	if (!discard) {
+		int rc = zio_open(&c.zio, fs_path, c.bs, c.fill, c.dryrun);
+
+		if (rc == -1) {
+			fprintf(stderr, "%s: failed to open filesystem %s\n",
+				argv[0], fs_path);
+			finish(&c, 1);
+		} else if (rc == -2) {
+			fprintf(stderr, "%s: out of memory (surely not?)\n",
+				argv[0]);
+			finish(&c, 1);
+		}
+	}
+
 	if (zf_pass(&c))
 		finish(&c, 1);
 
 	ret = ext2fs_close(c.fs);
 	if (c.zero_fd >= 0)
 		close(c.zero_fd);
-	free(c.buf);
-	free(c.fillbuf);
+	zio_close(&c.zio);
+	free(c.fmap);
 	if (ret) {
 		fprintf(stderr, "%s: error while closing filesystem\n",
 			argv[0]);
