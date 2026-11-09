@@ -67,7 +67,7 @@ int zio_open(struct zio *z, const char *path, size_t bs,
 void zio_close(struct zio *z);
 
 /* Prime a read of blocks [blk, blk+count) (count*bs <= ZIO_CHUNK_BYTES).
- * uring: submit now (next in-order seq). sync: no-op.
+ * uring: submit now (next in-order seq). sync: records the range; zio_read performs it.
  * Must not be called more than ZIO_MAX_SLOTS ahead of zio_read. */
 void zio_prime(struct zio *z, uint64_t blk, unsigned int count);
 

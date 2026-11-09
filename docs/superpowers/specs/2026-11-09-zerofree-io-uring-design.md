@@ -186,8 +186,7 @@ I/O protocol (pinned, from builder review 2026-11-09):
    (offsets/lengths multiples of blocksize ≥ 1 KiB), sourced from
    `fillbuf + subrun_start*bs`. Sub-runs within a chunk are disjoint and
    ordered. At end of pass, `zio_drain` reaps all write CQEs; any error
-   aborts with the pinned write message. (No fsync — today's `pwrite`
-   path has the same durability semantics; the tool never fsyncs.)
+   aborts with the pinned write message. (Close-time fsync: see decision 14.)
 8. **Offload stays synchronous** (fallocate/BLKZEROOUT per dirty sub-run).
    These are metadata-only operations with no data transfer; queuing them
    in the ring (`IORING_OP_FALLOCATE`) buys nothing and complicates the
@@ -239,6 +238,32 @@ I/O protocol (pinned, from builder review 2026-11-09):
       2026-11-08 plan's Review Focus).
     - Bench: 4 GiB image scenarios (clean pass, dirty→0, dirty→0xBB)
       before/after, reported in the final summary.
+14. **Close-time fsync and the sanctioned superblock delta.**
+    1. *Mechanism.* `ext2fs_close2` (e2fsprogs ≥1.4x,
+       `lib/ext2fs/closefs.c`) updates `s_wtime`/`s_kbytes_written`/
+       `s_checksum`, writes the changed superblock words, and
+       `io_channel_flush`es (fsync) only when `s_kbytes_written != 0` at
+       open AND the io channel wrote bytes AND the fs is RW. A
+       "pre-dirtied" image is one with non-zero `s_kbytes_written` (a
+       kernel mount/unmount or an earlier libext2fs tool wrote it).
+    2. *Consequence for this engine.* Data I/O bypasses `fs->io`, so
+       libext2fs never takes that close path. On pre-dirtied images the
+       output therefore differs from the pre-change binary in ≤12
+       superblock bytes (s_wtime, s_kbytes_written, s_checksum —
+       time-dependent, so the old output was never byte-stable on them
+       either): the **sanctioned delta**; data blocks, bitmaps and inodes
+       are always identical. On fresh images the two binaries' images are
+       byte-identical and neither fsyncs at exit (verified by syscall
+       trace: the only fsync in a run is libext2fs's open-time fsync,
+       present in both).
+    3. *The fix.* An explicit `fsync` of the engine fd under the same
+       condition the old binary took the close path (fill mode, not
+       dry-run, at least one block written, `s_kbytes_written != 0` at
+       open), after `zio_drain`, before `ext2fs_close`; failure prints the
+       pinned `error while closing filesystem` message and exits 1 (the
+       old binary's message/exit for a close-time fsync failure). The
+       fsync covers the zero-offload fd's writes too (same inode). On
+       fresh images no fsync happens — exact old behavior.
 
 ## What is left to the builder
 

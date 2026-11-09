@@ -7,7 +7,7 @@
  * License, version 2.
  *
  * Changes:
- * 2026-11-08  Modern x86-64 Linux rewrite (Linux + e2fsprogs 1.42+):
+ * 2026-11-08  Modern x86-64 Linux rewrite (Linux + e2fsprogs 1.43+):
  *             - remove the threaded -t mode entirely (its per-IO global
  *               mutex serialized all I/O anyway, and its partitioning
  *               silently skipped boundary blocks);
@@ -56,7 +56,7 @@
 #include "zio.h"
 
 #ifndef EXT2_FLAG_64BITS
-#error "zerofree requires e2fsprogs 1.42 or newer"
+#error "zerofree requires e2fsprogs 1.43 or newer"
 #endif
 
 #define OPEN_FLAGS (EXT2_FLAG_RW | EXT2_FLAG_64BITS)
@@ -319,13 +319,13 @@ static int zf_pass_fill(struct zf_ctx *c, struct run_it *it)
 static int zf_pass(struct zf_ctx *c)
 {
 	struct run_it it;
+	blk64_t nbits = c->total > c->fs->super->s_first_data_block ?
+			c->total - c->fs->super->s_first_data_block : 0;
 	int rc;
 
 	/* fmap bit i is block s_first_data_block + i (see main), so the
 	 * iterator yields offsets that the mode functions rebase. */
-	run_it_init(&it, c->fmap, 0,
-		    ext2fs_blocks_count(c->fs->super) -
-		    c->fs->super->s_first_data_block);
+	run_it_init(&it, c->fmap, 0, nbits);
 
 	if (c->verbose)
 		fprintf(stderr, "\r%4.1f%%", 0.0);
@@ -402,6 +402,8 @@ int main(int argc, char **argv)
 	bool discard = false;
 	const char *fs_path;
 	struct zf_ctx c;
+	bool sb_kbytes_written;
+	int fsync_err = 0;
 
 	while ((c_opt = getopt(argc, argv, "nvdf:")) != -1) {
 		switch (c_opt) {
@@ -461,6 +463,8 @@ int main(int argc, char **argv)
 			argv[0], fs_path);
 		return 1;
 	}
+	sb_kbytes_written =
+		ext2fs_le32_to_cpu(c.fs->super->s_kbytes_written) != 0;
 
 	c.bs = c.fs->blocksize;
 	c.chunk_blocks = (unsigned int)(ZIO_CHUNK_BYTES / c.bs);
@@ -536,12 +540,23 @@ int main(int argc, char **argv)
 	if (zf_pass(&c))
 		finish(&c, 1);
 
+	/* ext2fs_close2 fsyncs the image (and updates s_wtime,
+	 * s_kbytes_written, s_checksum) only if s_kbytes_written was
+	 * non-zero at open and the io channel wrote bytes.  The engine
+	 * writes through its own fd, so libext2fs skips that path:
+	 * replicate its condition here (fsync only; the superblock
+	 * fields stay untouched, a sanctioned delta, see the spec).
+	 * fsync on the engine fd also covers zero_fd (same inode). */
+	if (!c.dryrun && !c.discard && c.modified > 0 &&
+	    sb_kbytes_written && fsync(c.zio.fd) < 0)
+		fsync_err = 1;
+
 	ret = ext2fs_close(c.fs);
 	if (c.zero_fd >= 0)
 		close(c.zero_fd);
 	zio_close(&c.zio);
 	free(c.fmap);
-	if (ret) {
+	if (ret || fsync_err) {
 		fprintf(stderr, "%s: error while closing filesystem\n",
 			argv[0]);
 		return 1;

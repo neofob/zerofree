@@ -6,7 +6,7 @@ OBJS:=$(patsubst %.c,%.o,$(wildcard *.c))
 LIBS=-lext2fs
 
 # zerofree: modern single-threaded tool -- C17, x86-64-v3 (AVX2) baseline,
-# LTO, no dependencies beyond libext2fs (e2fsprogs >= 1.42).
+# LTO, no dependencies beyond libext2fs (e2fsprogs >= 1.43).
 ZF_CFLAGS=-std=gnu17 -O3 -march=x86-64-v3 -flto -Wall -Wextra -Wpedantic
 
 all: sparsify zerofree

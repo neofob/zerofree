@@ -168,6 +168,27 @@ int main(int argc, char **argv)
 		fail("block after run clobbered");
 	close(vfd);
 
+	/* error path: a read at EOF completes with res==0 -> NULL */
+	zio_prime(&z, NBLK, 1);
+	if (zio_read(&z) != NULL)
+		fail("EOF zio_read did not fail");
+
+	/* error path: writing through a read-only fd fails (EBADF),
+	 * reported by flush (sync) or by drain (uring) */
+	{
+		struct zio z2;
+		int wr;
+
+		if (zio_open(&z2, path, BS, 0x5A, true) != 0)
+			fail("zio_open rdonly");
+		wr = zio_flush_dirty(&z2, 0, 1);
+		if (wr == 0)
+			wr = zio_drain(&z2);
+		if (wr != 1)
+			fail("rdonly write not reported");
+		zio_close(&z2);
+	}
+
 	zio_close(&z);
 	f = fopen(path, "rb");
 	if (!f)
